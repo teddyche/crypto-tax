@@ -1,0 +1,18 @@
+# Backend / Python
+__pycache__/
+*.pyc
+backend/__pycache__/
+backend/*.sqlite
+backend/.venv/
+
+# Frontend / Node
+frontend/node_modules/
+frontend/dist/
+
+# Données persistantes
+data/
+*.db
+
+# Secrets & env
+.env
+.env.*
