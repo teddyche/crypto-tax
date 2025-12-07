@@ -27,6 +27,12 @@ def map_operation_to_side(operation: str, quantity: float) -> str:
     if op.startswith("WITHDRAW"):
         return "WITHDRAWAL"
 
+    if "SIMPLE EARN FLEXIBLE INTEREST" in op:
+        return "INCOME"  # réel revenu
+
+    if "SIMPLE EARN FLEXIBLE SUBSCRIPTION" in op:
+        return "SUBSCRIPTION"  # immobilisation
+
     # 3. Conversions, spend/buy, etc. (selon ce qu’on avait déjà)
     if "BINANCE CONVERT" in op or op == "CONVERT":
         return "CONVERT"
@@ -546,6 +552,9 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
         elif to_asset and not from_asset:
             # Achat direct depuis fiat
             side = "BUY"
+
+        if "SIMPLE EARN" in op_upper:
+            pair = coin
 
         tx = TransactionDB(
             datetime=dt,

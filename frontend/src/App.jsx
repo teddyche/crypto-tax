@@ -25,6 +25,7 @@ const TYPE_BADGE_COLORS = {
   WITHDRAWAL: "bg-orange-500/10 text-orange-300 border border-orange-500/30",
   CONVERT: "bg-violet-500/10 text-violet-300 border border-violet-500/30",
   INCOME: "bg-amber-500/10 text-amber-300 border border-amber-500/30",
+  SUBSCRIPTION: "bg-slate-500/10 text-slate-300 border border-slate-600/40",
   OTHER: "bg-slate-500/10 text-slate-300 border border-slate-500/30",
 };
 
@@ -40,8 +41,10 @@ function formatSideLabel(side) {
       return "Retrait";
     case "CONVERT":
       return "Convert";
+    case "SUBSCRIPTION":
+      return "Subscription (Earn)";
     case "INCOME":
-      return "Revenu";
+      return "Revenu (Earn)";
     default:
       return "Autre";
   }
