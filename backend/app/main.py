@@ -447,14 +447,25 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
 
     # On insère les simples d'abord (DEPOSIT / WITHDRAW / INCOME)
     for r in simple_rows:
+        qty = r["quantity"]
+        pair = r["pair"]
+        side = r["side"]
+
+        price_eur = 0.0
+        fees_eur = 0.0
+
+        # Si c'est de l'EUR qui rentre / sort → on met le montant en price_eur
+        if pair == "EUR":
+            price_eur = abs(qty)
+
         tx = TransactionDB(
             datetime=r["datetime"],
             exchange="Binance",
-            pair=r["pair"],
-            side=r["side"],
-            quantity=r["quantity"],
-            price_eur=0.0,
-            fees_eur=0.0,
+            pair=pair,
+            side=side,
+            quantity=qty,
+            price_eur=price_eur,
+            fees_eur=fees_eur,
             note=r["note"],
         )
         db.add(tx)
@@ -471,6 +482,8 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
         spends = comp["spends"]
         buys = comp["buys"]
         fees = comp["fees"]
+        total_spent_eur = sum(abs(qty) for coin, qty in spends if coin == "EUR")
+        total_fees_eur = sum(abs(qty) for coin, qty in fees if coin == "EUR")
 
         # Détermine actif "from" et "to"
         from_asset, from_amount = None, 0.0
@@ -524,8 +537,8 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
             pair=pair,
             side=side,
             quantity=quantity,
-            price_eur=0.0,
-            fees_eur=0.0,
+            price_eur=total_spent_eur,
+            fees_eur=total_fees_eur,
             note=note,
         )
         db.add(tx)
