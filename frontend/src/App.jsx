@@ -80,16 +80,21 @@ function App() {
   // Filtre de type (multi)
   const [selectedTypes, setSelectedTypes] = useState([]);
 
+  // Pagination
+  const [pageSize, setPageSize] = useState(100);
+  const [page, setPage] = useState(1);
+
   // Upload
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState("");
   const [uploadSuccess, setUploadSuccess] = useState("");
 
-  // --- Helpers filtres ---
+  // --- Helpers filtres & pagination ---
 
   const buildQueryString = () => {
     const params = new URLSearchParams();
-    params.set("limit", "100");
+    params.set("limit", String(pageSize));
+    params.set("offset", String((page - 1) * pageSize));
 
     if (selectedYear !== "all") {
       params.set("year", String(selectedYear));
@@ -138,7 +143,7 @@ function App() {
       setYears(newYears);
       setAssets(newAssets);
 
-      // Si l'année / l'actif sélectionné disparaît, on reset sur "all"
+      // Si l’année / l’actif sélectionné n’existe plus, reset
       if (selectedYear !== "all" && !newYears.includes(Number(selectedYear))) {
         setSelectedYear("all");
       }
@@ -187,25 +192,30 @@ function App() {
     }
   };
 
+  const pageCount = useMemo(() => {
+    const total = summary.total_transactions || 0;
+    if (total === 0) return 1;
+    return Math.max(1, Math.ceil(total / pageSize));
+  }, [summary.total_transactions, pageSize]);
+
   // --- useEffects ---
 
-  // Au mount : charge filtres + données globales
+  // Reset page quand les filtres changent
   useEffect(() => {
-    (async () => {
-      await fetchFilters();
-      await fetchSummaryAndTransactions();
-    })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    setPage(1);
+  }, [selectedYear, selectedAsset, selectedTypes, pageSize]);
 
-  // Quand les filtres changent : recharge filtres croisés + données
+  // Filtres croisés (années <-> actifs)
   useEffect(() => {
-    (async () => {
-      await fetchFilters();
-      await fetchSummaryAndTransactions();
-    })();
+    fetchFilters();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedYear, selectedAsset, selectedTypes]);
+  }, [selectedYear, selectedAsset]);
+
+  // Data + summary
+  useEffect(() => {
+    fetchSummaryAndTransactions();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedYear, selectedAsset, selectedTypes, page, pageSize]);
 
   // --- Upload CSV Binance ---
 
@@ -284,6 +294,14 @@ function App() {
   };
 
   const clearTypes = () => setSelectedTypes([]);
+
+  const goPrevPage = () => {
+    setPage((p) => Math.max(1, p - 1));
+  };
+
+  const goNextPage = () => {
+    setPage((p) => Math.min(pageCount, p + 1));
+  };
 
   // --- Render ---
 
@@ -396,8 +414,8 @@ function App() {
 
             {/* Types */}
             <div className="flex flex-col text-xs gap-1">
-              <span className="text-slate-400 uppercase tracking-wide">
-                Types d&apos;opération
+              <span="text-slate-400 uppercase tracking-wide">
+                TYPES D&apos;OPÉRATION
               </span>
               <div className="flex flex-wrap gap-2">
                 <button
@@ -484,15 +502,64 @@ function App() {
 
         {/* Tableau transactions */}
         <section className="rounded-2xl bg-slate-950/70 border border-slate-800 shadow-xl shadow-black/50 overflow-hidden">
-          <div className="flex items-center justify-between px-4 py-3 border-b border-slate-800 text-xs text-slate-400">
+          <div className="flex flex-col md:flex-row md:items-center md:justify-between px-4 py-3 border-b border-slate-800 text-xs text-slate-400 gap-2">
             <span>Transactions récentes</span>
-            <span>
-              Affichage des{" "}
-              <span className="text-slate-200 font-medium">
-                {transactions.length}
-              </span>{" "}
-              dernières lignes
-            </span>
+            <div className="flex items-center gap-3">
+              <div className="flex items-center gap-1">
+                <span>
+                  Affichage de{" "}
+                  <span className="text-slate-200 font-medium">
+                    {transactions.length}
+                  </span>{" "}
+                  lignes
+                </span>
+                <span className="hidden sm:inline">
+                  • Page{" "}
+                  <span className="text-slate-200 font-medium">{page}</span> /{" "}
+                  <span className="text-slate-200 font-medium">
+                    {pageCount}
+                  </span>
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="hidden sm:inline">Lignes par page</span>
+                <select
+                  value={pageSize}
+                  onChange={(e) => setPageSize(Number(e.target.value))}
+                  className="bg-slate-900 border border-slate-700 rounded-md px-2 py-1 text-xs text-slate-100 focus:outline-none focus:ring-1 focus:ring-emerald-400/60"
+                >
+                  <option value={50}>50</option>
+                  <option value={100}>100</option>
+                  <option value={150}>150</option>
+                </select>
+                <button
+                  type="button"
+                  onClick={goPrevPage}
+                  disabled={page <= 1}
+                  className={classNames(
+                    "px-2 py-1 rounded-md border text-xs",
+                    page <= 1
+                      ? "border-slate-700 text-slate-600 cursor-not-allowed"
+                      : "border-slate-600 text-slate-200 hover:border-slate-300"
+                  )}
+                >
+                  ←
+                </button>
+                <button
+                  type="button"
+                  onClick={goNextPage}
+                  disabled={page >= pageCount || summary.total_transactions === 0}
+                  className={classNames(
+                    "px-2 py-1 rounded-md border text-xs",
+                    page >= pageCount || summary.total_transactions === 0
+                      ? "border-slate-700 text-slate-600 cursor-not-allowed"
+                      : "border-slate-600 text-slate-200 hover:border-slate-300"
+                  )}
+                >
+                  →
+                </button>
+              </div>
+            </div>
           </div>
 
           <div className="overflow-x-auto">
@@ -536,6 +603,11 @@ function App() {
                       TYPE_BADGE_COLORS[sideUpper] ||
                       TYPE_BADGE_COLORS.OTHER;
 
+                    const qtyNumber = Number(tx.quantity ?? 0);
+                    let qtyColor = "text-slate-200";
+                    if (qtyNumber > 0) qtyColor = "text-emerald-400";
+                    else if (qtyNumber < 0) qtyColor = "text-red-400";
+
                     return (
                       <tr
                         key={tx.id}
@@ -557,7 +629,12 @@ function App() {
                         <td className="px-3 py-2 text-slate-200">
                           {tx.pair || "—"}
                         </td>
-                        <td className="px-3 py-2 text-right text-slate-200 tabular-nums">
+                        <td
+                          className={classNames(
+                            "px-3 py-2 text-right tabular-nums",
+                            qtyColor
+                          )}
+                        >
                           {tx.quantity?.toLocaleString("fr-FR", {
                             maximumFractionDigits: 8,
                           }) || "0"}
