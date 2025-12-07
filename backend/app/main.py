@@ -1,51 +1,81 @@
+from __future__ import annotations
+
+from collections import Counter
 from datetime import datetime
+from io import StringIO
 from typing import List, Optional
 
 import csv
-from io import StringIO
-
-from fastapi import (
-    FastAPI,
-    Depends,
-    UploadFile,
-    File,
-    Query,
-)
+from fastapi import Depends, FastAPI, File, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy.orm import Session
 from sqlalchemy import func
+from sqlalchemy.orm import Session
 
-from .db import Base, engine, SessionLocal
-from .models import TransactionDB
+from backend.app.db import Base, SessionLocal, engine
+from backend.app.models import TransactionDB
 
-
-# -------------------------------------------------------------------
+# --------------------------------------------------------------------
 # DB init
-# -------------------------------------------------------------------
+# --------------------------------------------------------------------
 
 # Crée les tables si elles n'existent pas
 Base.metadata.create_all(bind=engine)
 
-
-# -------------------------------------------------------------------
+# --------------------------------------------------------------------
 # FastAPI app
-# -------------------------------------------------------------------
+# --------------------------------------------------------------------
 
 app = FastAPI(title="CryptoTax API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # à restreindre plus tard
+    allow_origins=["*"],  # à restreindre plus tard (React dev, etc.)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# --------------------------------------------------------------------
+# Pydantic models
+# --------------------------------------------------------------------
 
-# -------------------------------------------------------------------
-# Dépendance DB
-# -------------------------------------------------------------------
+
+class Transaction(BaseModel):
+    """
+    Modèle exposé par l’API (DTO).
+    On sépare bien ça du modèle SQLAlchemy TransactionDB.
+    """
+
+    id: int | None = None
+    datetime: datetime
+    exchange: str
+    pair: str
+    side: str  # Operation Binance brute (BUY, SELL, FEE, Referrer Commission, etc.)
+    quantity: float
+    price_eur: float
+    fees_eur: float
+    note: Optional[str] = None
+
+    class Config:
+        from_attributes = True  # pour SQLAlchemy 2.x (remplace orm_mode)
+
+
+class SummaryOut(BaseModel):
+    total_transactions: int
+    total_buy: int
+    total_sell: int
+    total_deposit: int
+    total_withdrawal: int
+    total_fee: int
+    total_commission: int
+    total_other: int
+
+
+# --------------------------------------------------------------------
+# DB dependency
+# --------------------------------------------------------------------
+
 
 def get_db():
     db = SessionLocal()
@@ -55,119 +85,63 @@ def get_db():
         db.close()
 
 
-# -------------------------------------------------------------------
-# Schémas Pydantic
-# -------------------------------------------------------------------
-
-class TransactionOut(BaseModel):
-    id: int
-    datetime: datetime
-    exchange: str
-    pair: str
-    side: str
-    quantity: float
-    price_eur: float | None = None
-    fees_eur: float | None = None
-    note: Optional[str] = None
-
-    class Config:
-        from_attributes = True  # SQLAlchemy -> Pydantic
+# --------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------
 
 
-class TransactionCreate(BaseModel):
-    datetime: datetime
-    exchange: str
-    pair: str
-    side: str
-    quantity: float
-    price_eur: float = 0.0
-    fees_eur: float = 0.0
-    note: Optional[str] = None
-
-
-class SummaryOut(BaseModel):
-    total_transactions: int
-    total_buy: int
-    total_sell: int
-    total_deposit: int
-    total_withdrawal: int
-
-
-# -------------------------------------------------------------------
-# Utilitaires
-# -------------------------------------------------------------------
-
-def normalize_binance_operation(operation: str) -> str:
+def classify_operation(operation: str | None) -> str:
     """
-    Normalise les opérations Binance en un petit set :
-    BUY / SELL / DEPOSIT / WITHDRAWAL / FEE / CONVERT / OTHER
-    """
-    op = (operation or "").strip().upper()
+    Prend le champ TransactionDB.side (Operation Binance brute)
+    et renvoie un bucket normalisé.
 
-    # Trades classiques
+    Exemples :
+    - "BUY"                     -> BUY
+    - "SELL"                    -> SELL
+    - "WITHDRAW"               -> WITHDRAWAL
+    - "Deposit" / "DEPOSIT"    -> DEPOSIT
+    - "Referrer Commission"    -> COMMISSION
+    - "Commission History"     -> COMMISSION
+    - "Fee" / "Trading fee"    -> FEE
+    - tout le reste            -> OTHER
+    """
+    op = (operation or "").upper()
+
     if op == "BUY":
         return "BUY"
     if op == "SELL":
         return "SELL"
-
-    # Dépôts / revenus (commissions, rewards, etc.)
-    if op in {
-        "DEPOSIT",
-        "FIAT DEPOSIT",
-        "CRYPTO DEPOSIT",
-        "REFERRER COMMISSION",
-        "COMMISSION HISTORY",
-        "DISTRIBUTION",
-        "REALIZED PROFIT",
-        "REALIZED_PNL",
-        "INCOME",
-        "INCOME_HISTORY",
-        "USD-M FUTURES REFERRER COMMISSION",
-    }:
-        return "DEPOSIT"
-
-    # Retraits
-    if op in {
-        "WITHDRAW",
-        "WITHDRAWAL",
-        "FIAT WITHDRAW",
-        "CRYPTO WITHDRAW",
-        "TRANSFER_OUT",
-    }:
+    if "WITHDRAW" in op:
         return "WITHDRAWAL"
-
-    # Frais
-    if op in {
-        "FEE",
-        "TRADING FEE",
-        "COMMISSION",
-        "COMMISSION FEE",
-        "FUNDING FEE",
-    }:
+    if "DEPOSIT" in op:
+        return "DEPOSIT"
+    if "COMMISSION" in op:
+        # Referrer Commission, Commission History, etc.
+        return "COMMISSION"
+    if "FEE" in op:
         return "FEE"
-
-    # Conversions internes Binance
-    if "CONVERT" in op or "SMALL ASSETS EXCHANGE BNB" in op:
-        return "CONVERT"
-
     return "OTHER"
 
 
-# -------------------------------------------------------------------
-# Routes
-# -------------------------------------------------------------------
+# --------------------------------------------------------------------
+# Routes simples
+# --------------------------------------------------------------------
+
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
 
-@app.get("/transactions", response_model=List[TransactionOut])
+@app.get("/transactions", response_model=List[Transaction])
 def list_transactions(
         limit: int = Query(500, ge=1, le=5000),
         offset: int = Query(0, ge=0),
         db: Session = Depends(get_db),
 ):
+    """
+    Liste paginée des transactions, ordonnées par date DESC.
+    """
     rows = (
         db.query(TransactionDB)
         .order_by(TransactionDB.datetime.desc())
@@ -178,11 +152,53 @@ def list_transactions(
     return rows
 
 
-@app.post("/transactions", response_model=TransactionOut)
-def create_transaction(
-        tx: TransactionCreate,
+@app.get("/summary", response_model=SummaryOut)
+def get_summary(
+        year: int | None = Query(None),
+        asset: str | None = Query(None),
         db: Session = Depends(get_db),
 ):
+    """
+    Résumé des transactions, avec classification des opérations Binance.
+    Les compteurs sont faits à la volée à partir de TransactionDB.side.
+    """
+    query = db.query(TransactionDB)
+
+    if year is not None:
+        query = query.filter(func.extract("year", TransactionDB.datetime) == year)
+
+    if asset:
+        # pair contient le coin : "BCH", "USDT", etc.
+        query = query.filter(TransactionDB.pair.ilike(f"%{asset}%"))
+
+    counter: Counter[str] = Counter()
+    total = 0
+
+    for tx in query:
+        bucket = classify_operation(tx.side)
+        counter[bucket] += 1
+        total += 1
+
+    # Dépôts = vrais DEPOSIT + toutes les commissions (revenus)
+    deposit_like = counter["DEPOSIT"] + counter["COMMISSION"]
+
+    return SummaryOut(
+        total_transactions=total,
+        total_buy=counter["BUY"],
+        total_sell=counter["SELL"],
+        total_deposit=deposit_like,
+        total_withdrawal=counter["WITHDRAWAL"],
+        total_fee=counter["FEE"],
+        total_commission=counter["COMMISSION"],
+        total_other=counter["OTHER"],
+    )
+
+
+@app.post("/transactions", response_model=Transaction)
+def create_transaction(tx: Transaction, db: Session = Depends(get_db)):
+    """
+    Création manuelle d’une transaction (pour tests / futurs imports).
+    """
     tx_db = TransactionDB(
         datetime=tx.datetime,
         exchange=tx.exchange,
@@ -199,39 +215,9 @@ def create_transaction(
     return tx_db
 
 
-@app.get("/summary", response_model=SummaryOut)
-def get_summary(
-        year: int | None = Query(None),
-        asset: str | None = Query(None),
-        db: Session = Depends(get_db),
-):
-    """
-    Petit résumé agrégé : nombre de BUY / SELL / DEPOSIT / WITHDRAWAL,
-    éventuellement filtré par année et/ou asset (pair).
-    """
-    query = db.query(TransactionDB)
-
-    if year is not None:
-        query = query.filter(func.extract("year", TransactionDB.datetime) == year)
-
-    if asset:
-        # filtre large : BCH ou BCH/USDT, etc.
-        query = query.filter(TransactionDB.pair.ilike(f"%{asset}%"))
-
-    total = query.count()
-
-    total_buy = query.filter(TransactionDB.side == "BUY").count()
-    total_sell = query.filter(TransactionDB.side == "SELL").count()
-    total_deposit = query.filter(TransactionDB.side == "DEPOSIT").count()
-    total_withdrawal = query.filter(TransactionDB.side == "WITHDRAWAL").count()
-
-    return SummaryOut(
-        total_transactions=total,
-        total_buy=total_buy,
-        total_sell=total_sell,
-        total_deposit=total_deposit,
-        total_withdrawal=total_withdrawal,
-    )
+# --------------------------------------------------------------------
+# Import Binance CSV (Spot & Futures)
+# --------------------------------------------------------------------
 
 
 @app.post("/import/binance")
@@ -240,15 +226,20 @@ async def import_binance(
         db: Session = Depends(get_db),
 ):
     """
-    Import CSV 'Transaction History' Binance au format :
-
-    "User_ID","UTC_Time","Account","Operation","Coin","Change","Remark"
+    Import CSV Binance (export "Account Statement" type).
+    Format typique :
+    - User_ID
+    - UTC_Time
+    - Account
+    - Operation
+    - Coin
+    - Change
+    - Remark
     """
-
     content = await file.read()
     s = content.decode("utf-8", errors="ignore")
 
-    # Détection séparateur ("," ou ";")
+    # Détection séparateur , ou ;
     sample = s[:1024]
     dialect = csv.Sniffer().sniff(sample, delimiters=",;")
     reader = csv.DictReader(StringIO(s), dialect=dialect)
@@ -262,47 +253,36 @@ async def import_binance(
 
         # Format: 2020-11-02 07:39:45
         try:
-            parsed_date = datetime.strptime(raw_date.strip(), "%Y-%m-%d %H:%M:%S")
+            parsed_date = datetime.strptime(raw_date, "%Y-%m-%d %H:%M:%S")
         except ValueError:
-            # Si autre format : on skip pour l'instant
             continue
 
-        account = (row.get("Account") or "").strip()                # Spot / Futures...
-        raw_operation = (row.get("Operation") or "UNKNOWN").strip() # ex: Referrer Commission
+        operation = (row.get("Operation") or "UNKNOWN").strip()
         coin = (row.get("Coin") or "UNKNOWN").strip()
-        change_str = (row.get("Change") or "0").strip()
-        remark = (row.get("Remark") or "").strip() or None
+        change_str = row.get("Change") or "0"
 
-        # Quantité signée (dans la devise "Coin")
+        # Quantité : on garde la valeur signée
         try:
-            quantity = float(change_str.replace(",", "."))
+            quantity = float(str(change_str).replace(",", "."))
         except ValueError:
             quantity = 0.0
 
-        # Normalisation de l'opération
-        normalized_side = normalize_binance_operation(raw_operation)
-
-        # Pour debug/compliance : on garde tout dans note
-        note_parts = [raw_operation]
-        if account:
-            note_parts.append(f"Account={account}")
-        if remark:
-            note_parts.append(f"Remark={remark}")
-        full_note = " | ".join(note_parts)
-
-        # Pas de prix / fees en EUR dans cet export → 0 pour l’instant
+        # Pour l’instant on ne connaît pas le prix en EUR à partir de ce CSV
         price_eur = 0.0
         fees_eur = 0.0
+
+        note = row.get("Remark") or None
 
         tx = TransactionDB(
             datetime=parsed_date,
             exchange="Binance",
-            pair=coin,              # ici Coin = USDT, BCH, etc.
-            side=normalized_side,   # 🔥 valeur normalisée
-            quantity=quantity,      # quantité signée
+            account=row.get("Account") or None,  # si tu as ce champ dans ton modèle
+            pair=coin,          # ici on stocke juste le coin (BCH, USDT, etc.)
+            side=operation,     # Operation Binance brute
+            quantity=quantity,  # signé
             price_eur=price_eur,
             fees_eur=fees_eur,
-            note=full_note,
+            note=note,
         )
 
         db.add(tx)
