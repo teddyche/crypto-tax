@@ -14,9 +14,9 @@ services:
   backend:
     image: python:3.12
     container_name: cryptotax-backend
-    working_dir: /app
+    working_dir: /app/backend
     volumes:
-      - ./backend:/app
+      - ./:/app
     environment:
       DATABASE_URL: ${DATABASE_URL}
       BACKEND_PORT: ${BACKEND_PORT}
@@ -27,16 +27,16 @@ services:
         uvicorn app.main:app --host 0.0.0.0 --port ${BACKEND_PORT}
       "
     ports:
-      - "8010:8010"     # ⬅️ PORT EN DUR
+      - "8010:8010"
     depends_on:
       - postgres
 
   frontend:
     image: node:20
     container_name: cryptotax-frontend
-    working_dir: /app
+    working_dir: /app/frontend
     volumes:
-      - ./frontend:/app
+      - ./:/app
     environment:
       FRONTEND_PORT: ${FRONTEND_PORT}
     command: >
@@ -45,7 +45,7 @@ services:
         npm run dev -- --host 0.0.0.0 --port ${FRONTEND_PORT}
       "
     ports:
-      - "3010:3010"     # ⬅️ PORT EN DUR
+      - "3010:3010"
     depends_on:
       - backend
 
