@@ -414,7 +414,7 @@ function App() {
 
             {/* Types */}
             <div className="flex flex-col text-xs gap-1">
-              <span="text-slate-400 uppercase tracking-wide">
+              <span className="text-slate-400 uppercase tracking-wide">
                 TYPES D&apos;OPÉRATION
               </span>
               <div className="flex flex-wrap gap-2">
@@ -450,7 +450,6 @@ function App() {
                 })}
               </div>
             </div>
-          </div>
 
           {/* Upload CSV */}
           <div className="flex items-start gap-3">
