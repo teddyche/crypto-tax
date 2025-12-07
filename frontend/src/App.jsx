@@ -1,4 +1,3 @@
-import "./index.css";
 import React, { useEffect, useMemo, useState } from "react";
 
 // Tu peux mettre ça dans un .env plus tard
