@@ -533,26 +533,29 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
         spends = comp["spends"]
         buys = comp["buys"]
         fees = comp["fees"]
+
+        # Total EUR utilisé dans l'opération (vendu ou dépensé)
         total_spent_eur = sum(abs(qty) for coin, qty in spends if coin == "EUR")
+        # Total EUR payé en frais (rare mais possible)
         total_fees_eur = sum(abs(qty) for coin, qty in fees if coin == "EUR")
 
-        # Détermine actif "from" et "to"
+        # -------- from / to assets --------
         from_asset, from_amount = None, 0.0
         to_asset, to_amount = None, 0.0
 
-        # on considère la première spend négative comme "from"
+        # première spend négative = ce qu'on "donne"
         for coin, qty in spends:
             if qty < 0 and from_asset is None:
                 from_asset, from_amount = coin, qty
 
-        # on prend le plus gros buy positif comme "to"
+        # plus gros buy positif = ce qu'on "reçoit"
         max_buy = 0.0
         for coin, qty in buys:
             if qty > 0 and abs(qty) > max_buy:
                 max_buy = abs(qty)
                 to_asset, to_amount = coin, qty
 
-        # Fees agrégés en texte
+        # -------- Note lisible --------
         fees_summary = ", ".join(f"{c} {qty}" for c, qty in fees)
 
         note_parts = []
@@ -561,26 +564,50 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
         if remark:
             note_parts.append(f"Remark={remark}")
         if from_asset and to_asset:
-            note_parts.append(f"From {from_amount} {from_asset} -> {to_amount} {to_asset}")
+            note_parts.append(
+                f"From {from_amount} {from_asset} -> {to_amount} {to_asset}"
+            )
         if fees_summary:
             note_parts.append(f"Fees: {fees_summary}")
 
         note = " | ".join(note_parts) if note_parts else None
 
-        # Classification finale
+        # -------- Classification + prix EUR --------
         side = "OTHER"
         pair = to_asset or from_asset or "UNKNOWN"
         quantity = to_amount if to_amount != 0 else from_amount
+        price_eur = 0.0
 
-        if from_asset and to_asset:
-            # Conversion d'un asset en un autre
-            side = "CONVERT"
-        elif from_asset and not to_asset:
-            # Vente sans contrepartie crypto détectée
-            side = "SELL"
-        elif to_asset and not from_asset:
-            # Achat direct depuis fiat
+        # 1) Achat direct avec EUR : EUR -> COIN
+        if from_asset == "EUR" and to_asset and to_asset != "EUR":
             side = "BUY"
+            pair = to_asset              # ex: BCH
+            quantity = to_amount         # +0.10 BCH
+            price_eur = abs(from_amount) # 49.5 €
+
+        # 2) Vente directe vers EUR : COIN -> EUR
+        elif to_asset == "EUR" and from_asset and from_asset != "EUR":
+            side = "SELL"
+            pair = from_asset            # ex: BCH
+            quantity = from_amount       # -0.10 BCH
+            price_eur = abs(to_amount)   # 49.5 €
+
+        # 3) Conversion crypto -> crypto (sans EUR direct)
+        elif from_asset and to_asset:
+            side = "CONVERT"
+            pair = to_asset
+            quantity = to_amount
+            # ici pas de price_eur fiable => 0 pour l'instant
+
+        # 4) Cas résiduels : on garde BUY/SELL génériques
+        elif from_asset and not to_asset:
+            side = "SELL"
+            pair = from_asset
+            quantity = from_amount
+        elif to_asset and not from_asset:
+            side = "BUY"
+            pair = to_asset
+            quantity = to_amount
 
         tx = TransactionDB(
             datetime=dt,
@@ -588,7 +615,7 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
             pair=pair,
             side=side,
             quantity=quantity,
-            price_eur=total_spent_eur,
+            price_eur=price_eur,
             fees_eur=total_fees_eur,
             note=note,
         )
