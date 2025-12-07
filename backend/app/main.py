@@ -133,46 +133,49 @@ def get_db():
 def normalize_side(tx: TransactionDB) -> str:
     """
     Normalise le field `side` pour l'affichage et les stats.
-    On garde :
-      - BUY / SELL
-      - DEPOSIT / WITHDRAWAL
+
+    On garde uniquement :
+      - BUY
+      - SELL
+      - DEPOSIT
+      - WITHDRAWAL
       - CONVERT
-      - INCOME (revenu Earn)
-      - SUBSCRIPTION (mise en Earn)
       - OTHER
+
+    Quelques règles :
+      - INCOME = affiché comme DEPOT (earn, intérêts…)
+      - Toute opé qui ressemble à un CONVERT passe en CONVERT,
+        même si le side brut est "BUY" ou "SELL".
     """
     raw = (tx.side or "").upper().strip()
     note = (tx.note or "").lower()
 
-    # Cas déjà propres (inclut INCOME & SUBSCRIPTION)
-    if raw in {
-        "BUY",
-        "SELL",
-        "DEPOSIT",
-        "WITHDRAWAL",
-        "CONVERT",
-        "INCOME",
-        "SUBSCRIPTION",
-    }:
-        return raw
-
-    # Buy Crypto With Fiat -> BUY
-    if "buy crypto with fiat" in note:
-        return "BUY"
-
-    # Withdraw / Deposit détectés dans la note
-    if "withdraw" in note:
-        return "WITHDRAWAL"
-    if "deposit" in note:
-        return "DEPOSIT"
-
-    # Convert : variantes bizarres Binance
+    # 1. CONVERT en priorité (même si side brut = BUY/SELL)
     if "convert" in note or raw in {
+        "CONVERT",
         "TRANSACTION SPEND",
         "TRANSACTION BUY",
         "TRANSACTION FEE",
     }:
         return "CONVERT"
+
+    # 2. INCOME (earn / intérêts) → affiché comme DEPOT
+    if raw == "INCOME":
+        return "DEPOSIT"
+
+    # 3. Cas déjà propres
+    if raw in {"BUY", "SELL", "DEPOSIT", "WITHDRAWAL"}:
+        return raw
+
+    # 4. Buy Crypto With Fiat -> BUY
+    if "buy crypto with fiat" in note:
+        return "BUY"
+
+    # 5. Withdraw / Deposit détectés dans la note
+    if "withdraw" in note:
+        return "WITHDRAWAL"
+    if "deposit" in note:
+        return "DEPOSIT"
 
     return "OTHER"
 
