@@ -7,8 +7,8 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
-from db import Base, engine, SessionLocal
-from models import TransactionDB   # modèle SQLAlchemy
+from .db import Base, engine, SessionLocal
+from .models import TransactionDB
 
 Base.metadata.create_all(bind=engine)
 
