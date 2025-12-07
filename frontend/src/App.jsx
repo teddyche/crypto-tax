@@ -417,7 +417,8 @@ function App() {
               <span className="text-slate-400 uppercase tracking-wide">
                 TYPES D&apos;OPÉRATION
               </span>
-              <div className="flex flex-wrap gap-2">
+
+              <div className="flex flex-wrap gap-2 mt-1">
                 <button
                   type="button"
                   onClick={clearTypes}
@@ -430,6 +431,7 @@ function App() {
                 >
                   Tous
                 </button>
+
                 {TYPE_FILTERS.map((t) => {
                   const active = selectedTypes.includes(t.value);
                   return (
