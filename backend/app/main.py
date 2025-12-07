@@ -11,7 +11,31 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from .db import Base, engine, SessionLocal
-from .models import TransactionDB
+from .models import TransactionDB, FXRate
+
+def get_usd_eur_rate(db: Session, dt: datetime) -> float:
+    """
+    Retourne le taux USD->EUR pour la date de la transaction.
+    S'il n'y a pas de taux exact ce jour-là, on prend le plus récent avant.
+    """
+    d = dt.date()
+
+    rate_obj = (
+        db.query(FXRate)
+        .filter(
+            FXRate.base == "USD",
+            FXRate.quote == "EUR",
+            FXRate.date <= d,
+            )
+        .order_by(FXRate.date.desc())
+        .first()
+    )
+
+    if rate_obj is None:
+        # fallback au cas où la table est vide
+        return 1.0
+
+    return rate_obj.rate
 
 def map_operation_to_side(operation: str, quantity: float) -> str:
     op = (operation or "").upper()
@@ -523,6 +547,9 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
         inserted += 1
 
     # Puis les opérations composées (Convert, Spend/Buy/Fee groupés)
+    usd_stables = {"USDT", "USDC", "BUSD", "USD"}
+
+    # Puis les opérations composées (Convert, Spend/Buy/Fee groupés)
     for key, comp in composed_ops.items():
         dt = comp["datetime"]
         if not dt:
@@ -534,28 +561,33 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
         buys = comp["buys"]
         fees = comp["fees"]
 
-        # Total EUR utilisé dans l'opération (vendu ou dépensé)
+        # ---- EUR direct ----
         total_spent_eur = sum(abs(qty) for coin, qty in spends if coin == "EUR")
-        # Total EUR payé en frais (rare mais possible)
         total_fees_eur = sum(abs(qty) for coin, qty in fees if coin == "EUR")
+
+        # ---- USD / stablecoins -> EUR via fx table ----
+        usd_spent = sum(abs(qty) for coin, qty in spends if coin in usd_stables)
+        usd_fees  = sum(abs(qty) for coin, qty in fees   if coin in usd_stables)
+
+        fx = get_usd_eur_rate(db, dt)
+
+        total_spent_eur += usd_spent * fx
+        total_fees_eur  += usd_fees * fx
 
         # -------- from / to assets --------
         from_asset, from_amount = None, 0.0
         to_asset, to_amount = None, 0.0
 
-        # première spend négative = ce qu'on "donne"
         for coin, qty in spends:
             if qty < 0 and from_asset is None:
                 from_asset, from_amount = coin, qty
 
-        # plus gros buy positif = ce qu'on "reçoit"
         max_buy = 0.0
         for coin, qty in buys:
             if qty > 0 and abs(qty) > max_buy:
                 max_buy = abs(qty)
                 to_asset, to_amount = coin, qty
 
-        # -------- Note lisible --------
         fees_summary = ", ".join(f"{c} {qty}" for c, qty in fees)
 
         note_parts = []
@@ -572,34 +604,34 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
 
         note = " | ".join(note_parts) if note_parts else None
 
-        # -------- Classification + prix EUR --------
+        # -------- Classification + affectation du price_eur --------
         side = "OTHER"
         pair = to_asset or from_asset or "UNKNOWN"
         quantity = to_amount if to_amount != 0 else from_amount
         price_eur = 0.0
 
-        # 1) Achat direct avec EUR : EUR -> COIN
-        if from_asset == "EUR" and to_asset and to_asset != "EUR":
+        # EUR natif (déjà traité) ou via stablecoins
+        if from_asset in {"EUR"} | usd_stables and to_asset and to_asset not in {"EUR"} | usd_stables:
+            # achat d'un coin avec EUR / USDT
             side = "BUY"
-            pair = to_asset              # ex: BCH
-            quantity = to_amount         # +0.10 BCH
-            price_eur = abs(from_amount) # 49.5 €
+            pair = to_asset
+            quantity = to_amount
+            price_eur = total_spent_eur
 
-        # 2) Vente directe vers EUR : COIN -> EUR
-        elif to_asset == "EUR" and from_asset and from_asset != "EUR":
+        elif to_asset in {"EUR"} | usd_stables and from_asset and from_asset not in {"EUR"} | usd_stables:
+            # vente d'un coin contre EUR / USDT
             side = "SELL"
-            pair = from_asset            # ex: BCH
-            quantity = from_amount       # -0.10 BCH
-            price_eur = abs(to_amount)   # 49.5 €
+            pair = from_asset
+            quantity = from_amount
+            price_eur = total_spent_eur  # valeur vendue
 
-        # 3) Conversion crypto -> crypto (sans EUR direct)
         elif from_asset and to_asset:
+            # convert crypto -> crypto
             side = "CONVERT"
             pair = to_asset
             quantity = to_amount
-            # ici pas de price_eur fiable => 0 pour l'instant
+            # price_eur laissé à 0 pour le moment
 
-        # 4) Cas résiduels : on garde BUY/SELL génériques
         elif from_asset and not to_asset:
             side = "SELL"
             pair = from_asset
@@ -615,7 +647,7 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
             pair=pair,
             side=side,
             quantity=quantity,
-            price_eur=price_eur,
+            price_eur=total_spent_eur,
             fees_eur=total_fees_eur,
             note=note,
         )
