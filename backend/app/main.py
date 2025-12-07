@@ -10,8 +10,8 @@ from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from db import Base, engine, SessionLocal
-from models import TransactionDB
+from .db import Base, engine, SessionLocal
+from .models import TransactionDB
 
 # Création des tables
 Base.metadata.create_all(bind=engine)
