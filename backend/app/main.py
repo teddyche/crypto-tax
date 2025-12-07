@@ -99,21 +99,13 @@ def get_db():
 
 
 # ---------- Helpers de normalisation Binance ----------
-
 def normalize_side(tx: TransactionDB) -> str:
-    """
-    Normalise le field `side` pour l'affichage et les stats.
-
-    On garde uniquement :
-      - BUY
-      - SELL
-      - DEPOSIT
-      - WITHDRAWAL
-      - CONVERT
-      - OTHER
-    """
     raw = (tx.side or "").upper().strip()
     note = (tx.note or "").lower()
+
+    # INCOME = on l'affiche comme un DEPOT (revenus/earn)
+    if raw == "INCOME":
+        return "DEPOSIT"
 
     # Cas déjà propres
     if raw in {"BUY", "SELL", "DEPOSIT", "WITHDRAWAL"}:
@@ -453,7 +445,7 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
 
     inserted = 0
 
-    # On insère les simples d'abord
+    # On insère les simples d'abord (DEPOSIT / WITHDRAW / INCOME)
     for r in simple_rows:
         tx = TransactionDB(
             datetime=r["datetime"],
@@ -468,38 +460,36 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
         db.add(tx)
         inserted += 1
 
-    # Puis les opérations composées
+    # Puis les opérations composées (Convert, Spend/Buy/Fee groupés)
     for key, comp in composed_ops.items():
         dt = comp["datetime"]
+        if not dt:
+            continue
+
         account = comp["account"]
         remark = comp["remark"]
         spends = comp["spends"]
         buys = comp["buys"]
         fees = comp["fees"]
 
-        if not dt:
-            continue
-
         # Détermine actif "from" et "to"
-        # On prend le premier spend négatif comme from,
-        # et le plus gros buy positif comme to.
         from_asset, from_amount = None, 0.0
         to_asset, to_amount = None, 0.0
 
+        # on considère la première spend négative comme "from"
         for coin, qty in spends:
             if qty < 0 and from_asset is None:
                 from_asset, from_amount = coin, qty
 
+        # on prend le plus gros buy positif comme "to"
         max_buy = 0.0
         for coin, qty in buys:
             if qty > 0 and abs(qty) > max_buy:
                 max_buy = abs(qty)
                 to_asset, to_amount = coin, qty
 
-        # Fees agrégés en libellé
-        fees_summary = ", ".join(
-            f"{c} {qty}" for c, qty in fees
-        )
+        # Fees agrégés en texte
+        fees_summary = ", ".join(f"{c} {qty}" for c, qty in fees)
 
         note_parts = []
         if account:
@@ -522,32 +512,21 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
             # Conversion d'un asset en un autre
             side = "CONVERT"
         elif from_asset and not to_asset:
-            # Vente sans contrepartie crypto détectée (ou export tronqué)
+            # Vente sans contrepartie crypto détectée
             side = "SELL"
         elif to_asset and not from_asset:
-            # Achat direct depuis fiat (ou export partiel)
+            # Achat direct depuis fiat
             side = "BUY"
 
-        operation = row.get("Operation") or "UNKNOWN"
-        coin = row.get("Coin") or "UNKNOWN"
-        change_str = row.get("Change") or "0"
-
-        try:
-            quantity = float(str(change_str).replace(",", "."))
-        except ValueError:
-            quantity = 0.0
-
-        side = map_operation_to_side(operation, quantity)
-
         tx = TransactionDB(
-            datetime=parsed_date,
+            datetime=dt,
             exchange="Binance",
-            pair=coin,
+            pair=pair,
             side=side,
             quantity=quantity,
             price_eur=0.0,
             fees_eur=0.0,
-            note=f"{operation} | {row.get('Remark') or ''}".strip(),
+            note=note,
         )
         db.add(tx)
         inserted += 1
