@@ -13,6 +13,31 @@ from sqlalchemy.orm import Session
 from .db import Base, engine, SessionLocal
 from .models import TransactionDB
 
+def map_operation_to_side(operation: str, quantity: float) -> str:
+    op = (operation or "").upper()
+
+    # 1. Commissions / rewards
+    if "REFERRER COMMISSION" in op or "COMMISSION HISTORY" in op:
+        # On les traite comme des dépôts / rewards entrants
+        return "DEPOSIT"
+
+    # 2. Dépôts / retraits classiques
+    if op.startswith("DEPOSIT"):
+        return "DEPOSIT"
+    if op.startswith("WITHDRAW"):
+        return "WITHDRAWAL"
+
+    # 3. Conversions, spend/buy, etc. (selon ce qu’on avait déjà)
+    if "BINANCE CONVERT" in op or op == "CONVERT":
+        return "CONVERT"
+
+    # 4. Fallback générique
+    if quantity > 0:
+        return "BUY"
+    if quantity < 0:
+        return "SELL"
+    return "OTHER"
+
 # Création des tables
 Base.metadata.create_all(bind=engine)
 
@@ -503,15 +528,26 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
             # Achat direct depuis fiat (ou export partiel)
             side = "BUY"
 
+        operation = row.get("Operation") or "UNKNOWN"
+        coin = row.get("Coin") or "UNKNOWN"
+        change_str = row.get("Change") or "0"
+
+        try:
+            quantity = float(str(change_str).replace(",", "."))
+        except ValueError:
+            quantity = 0.0
+
+        side = map_operation_to_side(operation, quantity)
+
         tx = TransactionDB(
-            datetime=dt,
+            datetime=parsed_date,
             exchange="Binance",
-            pair=pair,
+            pair=coin,
             side=side,
             quantity=quantity,
             price_eur=0.0,
             fees_eur=0.0,
-            note=note,
+            note=f"{operation} | {row.get('Remark') or ''}".strip(),
         )
         db.add(tx)
         inserted += 1
