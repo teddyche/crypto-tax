@@ -452,6 +452,7 @@ function App() {
                 })}
               </div>
             </div>
+           </div> {/* <-- ferme le <div className="flex flex-col gap-3"> */}
 
           {/* Upload CSV */}
           <div className="flex items-start gap-3">
