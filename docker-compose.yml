@@ -27,7 +27,7 @@ services:
         uvicorn app.main:app --host 0.0.0.0 --port ${BACKEND_PORT}
       "
     ports:
-      - "${BACKEND_PORT}:${BACKEND_PORT}"
+      - "8010:8010"     # ⬅️ PORT EN DUR
     depends_on:
       - postgres
 
@@ -45,7 +45,7 @@ services:
         npm run dev -- --host 0.0.0.0 --port ${FRONTEND_PORT}
       "
     ports:
-      - "${FRONTEND_PORT}:${FRONTEND_PORT}"
+      - "3010:3010"     # ⬅️ PORT EN DUR
     depends_on:
       - backend
 
