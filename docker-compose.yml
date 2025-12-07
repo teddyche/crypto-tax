@@ -22,8 +22,13 @@ services:
       BACKEND_PORT: ${BACKEND_PORT}
     command: >
       bash -c "
+        echo '=== LS /app ===' &&
+        ls -R /app &&
+        echo '=== PWD ===' &&
+        pwd &&
         pip install --upgrade pip &&
-        pip install -r requirements.txt &&
+        pip install -r /app/backend/requirements.txt &&
+        cd /app/backend &&
         uvicorn app.main:app --host 0.0.0.0 --port ${BACKEND_PORT}
       "
     ports:
@@ -41,6 +46,11 @@ services:
       FRONTEND_PORT: ${FRONTEND_PORT}
     command: >
       sh -c "
+        echo '=== LS /app ===' &&
+        ls -R /app &&
+        echo '=== PWD ===' &&
+        pwd &&
+        cd /app/frontend &&
         npm install &&
         npm run dev -- --host 0.0.0.0 --port ${FRONTEND_PORT}
       "
