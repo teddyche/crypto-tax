@@ -6,12 +6,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from .db import Base, engine, SessionLocal
-from .models import TransactionDB
+from db import Base, engine, SessionLocal
+from models import TransactionDB
 
 from fastapi import UploadFile, File
 import csv
 from io import StringIO
+from fastapi import Query
+from sqlalchemy import func, select
+from db import SessionLocal
+from models import Transaction  # adapte au nom réel
 
 # Crée les tables si elles n'existent pas
 Base.metadata.create_all(bind=engine)
@@ -26,6 +30,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+from pydantic import BaseModel
+from typing import Literal
+
+class TransactionOut(BaseModel):
+    id: int
+    datetime: datetime
+    exchange: str
+    pair: str
+    side: str
+    quantity: float
+    price_eur: float | None = None
+    fees_eur: float | None = None
+    note: str | None = None
+
+    class Config:
+        from_attributes = True  # si SQLAlchemy 2.x
+
+class SummaryOut(BaseModel):
+    total_transactions: int
+    total_buy: int
+    total_sell: int
+    total_deposit: int
+    total_withdrawal: int
 
 def get_db():
     db = SessionLocal()
@@ -68,6 +95,39 @@ def list_transactions(
         .all()
     )
     return rows
+
+@app.get("/summary", response_model=SummaryOut)
+def get_summary(
+        year: int | None = Query(None),
+        asset: str | None = Query(None),
+):
+    db = SessionLocal()
+    try:
+        query = db.query(Transaction)
+
+        if year is not None:
+            query = query.filter(func.extract("year", Transaction.datetime) == year)
+
+        if asset:
+            # supposition: pair contient l'asset, ex "BCH", "BCH/USDT", etc
+            query = query.filter(Transaction.pair.ilike(f"%{asset}%"))
+
+        total = query.count()
+
+        total_buy = query.filter(Transaction.side == "BUY").count()
+        total_sell = query.filter(Transaction.side == "SELL").count()
+        total_deposit = query.filter(Transaction.side == "DEPOSIT").count()
+        total_withdrawal = query.filter(Transaction.side == "WITHDRAWAL").count()
+
+        return SummaryOut(
+            total_transactions=total,
+            total_buy=total_buy,
+            total_sell=total_sell,
+            total_deposit=total_deposit,
+            total_withdrawal=total_withdrawal,
+        )
+    finally:
+        db.close()
 
 @app.post("/transactions", response_model=Transaction)
 def create_transaction(tx: Transaction, db: Session = Depends(get_db)):

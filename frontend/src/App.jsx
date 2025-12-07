@@ -1,116 +1,58 @@
 import { useEffect, useState } from "react";
 
-const API_BASE = `http://${window.location.hostname}:8010`;
-
 function App() {
-  const [transactions, setTransactions] = useState([]);
+  const [summary, setSummary] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
 
   useEffect(() => {
-    const fetchTransactions = async () => {
-      try {
-        const res = await fetch(`${API_BASE}/transactions`);
-        if (!res.ok) {
-          throw new Error(`HTTP ${res.status}`);
-        }
-        const data = await res.json();
-        setTransactions(data);
-      } catch (err) {
-        console.error(err);
-        setError("Impossible de charger les transactions.");
-      } finally {
+    fetch("http://192.168.1.69:8010/summary")
+      .then((res) => res.json())
+      .then((data) => {
+        setSummary(data);
         setLoading(false);
-      }
-    };
-
-    fetchTransactions();
+      })
+      .catch((err) => {
+        console.error("Erreur summary", err);
+        setLoading(false);
+      });
   }, []);
 
   return (
-    <div style={{ fontFamily: "system-ui, sans-serif", padding: "1.5rem" }}>
-      <h1 style={{ fontSize: "1.8rem", marginBottom: "0.5rem" }}>
-        CryptoTax – Dev - Test commit
-      </h1>
-      <p style={{ marginBottom: "1.5rem", color: "#555" }}>
-        Test de commit auto
-      </p>
+    <div style={{ padding: "24px", fontFamily: "system-ui" }}>
+      <h1>CryptoTax – Dev</h1>
+      <p>Prototype perso type Waltio (Binance pour l’instant).</p>
 
-      {loading && <p>Chargement des transactions…</p>}
-      {error && <p style={{ color: "red" }}>{error}</p>}
+      {loading && <p>Chargement du résumé…</p>}
 
-      {!loading && !error && (
-        <>
-          {transactions.length === 0 ? (
-            <p>Aucune transaction pour le moment.</p>
-          ) : (
-            <table
-              style={{
-                borderCollapse: "collapse",
-                width: "100%",
-                maxWidth: "1000px",
-              }}
-            >
-              <thead>
-                <tr>
-                  <th style={thStyle}>Date</th>
-                  <th style={thStyle}>Exchange</th>
-                  <th style={thStyle}>Pair</th>
-                  <th style={thStyle}>Side</th>
-                  <th style={thStyle}>Quantity</th>
-                  <th style={thStyle}>Prix (EUR)</th>
-                  <th style={thStyle}>Frais (EUR)</th>
-                  <th style={thStyle}>Note</th>
-                </tr>
-              </thead>
-              <tbody>
-                {transactions.map((tx) => (
-                  <tr key={tx.id}>
-                    <td style={tdStyle}>
-                      {new Date(tx.datetime).toLocaleString()}
-                    </td>
-                    <td style={tdStyle}>{tx.exchange}</td>
-                    <td style={tdStyle}>{tx.pair}</td>
-                    <td style={tdStyle}>
-                      <span
-                        style={{
-                          padding: "2px 6px",
-                          borderRadius: "4px",
-                          fontSize: "0.8rem",
-                          backgroundColor:
-                            tx.side === "BUY" ? "#d1fae5" : "#fee2e2",
-                          color: tx.side === "BUY" ? "#065f46" : "#b91c1c",
-                        }}
-                      >
-                        {tx.side}
-                      </span>
-                    </td>
-                    <td style={tdStyle}>{tx.quantity}</td>
-                    <td style={tdStyle}>{tx.price_eur.toFixed(2)}</td>
-                    <td style={tdStyle}>{tx.fees_eur.toFixed(2)}</td>
-                    <td style={tdStyle}>{tx.note || "-"}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </>
+      {summary && (
+        <div style={{ display: "flex", gap: "16px", margin: "16px 0" }}>
+          <Card label="Transactions totales" value={summary.total_transactions} />
+          <Card label="Achat (BUY)" value={summary.total_buy} />
+          <Card label="Vente (SELL)" value={summary.total_sell} />
+          <Card label="Dépôts" value={summary.total_deposit} />
+          <Card label="Retraits" value={summary.total_withdrawal} />
+        </div>
       )}
+
+      {/* ici tu gardes ton tableau de transactions existant */}
     </div>
   );
 }
 
-const thStyle = {
-  borderBottom: "1px solid #ddd",
-  textAlign: "left",
-  padding: "8px",
-  backgroundColor: "#f9fafb",
-};
-
-const tdStyle = {
-  borderBottom: "1px solid #eee",
-  padding: "8px",
-  fontSize: "0.9rem",
-};
+function Card({ label, value }) {
+  return (
+    <div
+      style={{
+        padding: "12px 16px",
+        borderRadius: "8px",
+        border: "1px solid #ddd",
+        minWidth: "150px",
+      }}
+    >
+      <div style={{ fontSize: "12px", color: "#666" }}>{label}</div>
+      <div style={{ fontSize: "20px", fontWeight: 600 }}>{value}</div>
+    </div>
+  );
+}
 
 export default App;
