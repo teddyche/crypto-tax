@@ -387,6 +387,22 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
             })
             continue
 
+        # --- Nouveau bloc : Binance Convert (2 lignes : +asset et -asset) ---
+        if operation == "Binance Convert":
+            group_key = f"{account}|{dt.strftime('%Y-%m-%d %H:%M:%S')}|BINANCE_CONVERT"
+
+            comp = composed_ops[group_key]
+            comp["datetime"] = dt
+            comp["account"] = account
+            comp["remark"] = "Binance Convert"
+
+            if qty < 0:
+                comp["spends"].append((coin, qty))
+            elif qty > 0:
+                comp["buys"].append((coin, qty))
+
+            continue
+
         # --- Cas composés : Transaction Spend / Buy / Fee / Convert / Trade ---
         # On groupe par account + timestamp + remark (clé empirique mais efficace)
         group_key = f"{account}|{dt.strftime('%Y-%m-%d %H:%M:%S')}|{remark}"
