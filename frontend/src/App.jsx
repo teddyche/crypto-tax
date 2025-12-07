@@ -30,7 +30,7 @@ function App() {
   return (
     <div style={{ fontFamily: "system-ui, sans-serif", padding: "1.5rem" }}>
       <h1 style={{ fontSize: "1.8rem", marginBottom: "0.5rem" }}>
-        CryptoTax – Dev
+        CryptoTax – Dev - Test commit
       </h1>
       <p style={{ marginBottom: "1.5rem", color: "#555" }}>
         Test de commit auto
