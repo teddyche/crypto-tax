@@ -33,7 +33,7 @@ function App() {
         CryptoTax – Dev
       </h1>
       <p style={{ marginBottom: "1.5rem", color: "#555" }}>
-        Prototype de l’app type Waltio – API FastAPI + Front React.
+        Test de commit auto
       </p>
 
       {loading && <p>Chargement des transactions…</p>}
