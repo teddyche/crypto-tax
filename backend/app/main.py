@@ -480,11 +480,19 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
             continue
 
         # --- Nouveau bloc : Binance Convert (2 lignes : +asset et -asset) ---
+        # --- Nouveau bloc : Binance Convert (2 lignes : +asset et -asset) ---
         if operation == "Binance Convert":
-            group_key = f"{account}|{dt.strftime('%Y-%m-%d %H:%M:%S')}|BINANCE_CONVERT"
+            # Certaines exports mettent les 2 lignes (EUR -xx / crypto +xx)
+            # à 1 seconde d'écart → on regroupe à la minute.
+            bucket = dt.strftime("%Y-%m-%d %H:%M")  # précision minute
+            group_key = f"{account}|{bucket}|BINANCE_CONVERT"
 
             comp = composed_ops[group_key]
-            comp["datetime"] = dt
+
+            # on garde la date la plus récente pour l'op globale
+            if comp["datetime"] is None or dt > comp["datetime"]:
+                comp["datetime"] = dt
+
             comp["account"] = account
             comp["remark"] = "Binance Convert"
 
