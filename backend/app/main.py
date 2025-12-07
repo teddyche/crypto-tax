@@ -74,6 +74,7 @@ def list_transactions(
     )
     return rows
 
+from sqlalchemy import func
 
 @app.get("/summary", response_model=SummaryOut)
 def get_summary(
