@@ -1,32 +1,34 @@
-// frontend/src/App.jsx
-import { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 
-const API_BASE = import.meta.env.VITE_API_URL || "http://192.168.1.69:8010";
+// Tu peux mettre ça dans un .env plus tard
+const API_URL = import.meta.env.VITE_API_URL || "http://192.168.1.69:8010";
 
 function formatDate(dateStr) {
-  try {
-    const d = new Date(dateStr);
-    return d.toLocaleString("fr-FR", {
-      day: "2-digit",
-      month: "short",
-      year: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-  } catch {
-    return dateStr;
-  }
-}
-
-function formatNumber(n, decimals = 8) {
-  if (n === null || n === undefined) return "-";
-  return Number(n).toLocaleString("fr-FR", {
-    minimumFractionDigits: 0,
-    maximumFractionDigits: decimals,
+  const d = new Date(dateStr);
+  if (Number.isNaN(d.getTime())) return dateStr;
+  return d.toLocaleString("fr-FR", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
   });
 }
 
-function mapSideToLabel(side) {
+function classNames(...classes) {
+  return classes.filter(Boolean).join(" ");
+}
+
+const TYPE_BADGE_COLORS = {
+  BUY: "bg-emerald-500/10 text-emerald-300 border border-emerald-500/30",
+  SELL: "bg-red-500/10 text-red-300 border border-red-500/30",
+  DEPOSIT: "bg-sky-500/10 text-sky-300 border border-sky-500/30",
+  WITHDRAWAL: "bg-orange-500/10 text-orange-300 border border-orange-500/30",
+  CONVERT: "bg-violet-500/10 text-violet-300 border border-violet-500/30",
+  OTHER: "bg-slate-500/10 text-slate-300 border border-slate-500/30",
+};
+
+function formatSideLabel(side) {
   switch (side) {
     case "BUY":
       return "Achat";
@@ -36,304 +38,256 @@ function mapSideToLabel(side) {
       return "Dépôt";
     case "WITHDRAWAL":
       return "Retrait";
+    case "CONVERT":
+      return "Convert";
     default:
-      return side || "Autre";
-  }
-}
-
-function mapSideToTagColor(side) {
-  switch (side) {
-    case "BUY":
-      return "#22c55e"; // vert
-    case "SELL":
-      return "#f97316"; // orange
-    case "DEPOSIT":
-      return "#0ea5e9"; // bleu
-    case "WITHDRAWAL":
-      return "#e11d48"; // rose/rouge
-    default:
-      return "#a3a3a3"; // gris
+      return "Autre";
   }
 }
 
 function App() {
   const [transactions, setTransactions] = useState([]);
-  const [summary, setSummary] = useState(null);
+  const [summary, setSummary] = useState({
+    total_transactions: 0,
+    total_buy: 0,
+    total_sell: 0,
+    total_deposit: 0,
+    total_withdrawal: 0,
+  });
 
-  const [yearsOptions, setYearsOptions] = useState([]);
-  const [assetsOptions, setAssetsOptions] = useState([]);
-
-  const [year, setYear] = useState("");
-  const [asset, setAsset] = useState("");
   const [loading, setLoading] = useState(false);
+  const [loadingSummary, setLoadingSummary] = useState(false);
 
-  // Chargement des options (années + actifs) au démarrage
+  // Filtres
+  const [years, setYears] = useState([]);
+  const [assets, setAssets] = useState([]);
+
+  const [selectedYear, setSelectedYear] = useState("all");
+  const [selectedAsset, setSelectedAsset] = useState("all");
+
+  // Upload
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState("");
+  const [uploadSuccess, setUploadSuccess] = useState("");
+
+  // Charge les années / actifs au démarrage
   useEffect(() => {
-    async function loadFilters() {
+    const fetchFilters = async () => {
       try {
         const [yearsRes, assetsRes] = await Promise.all([
-          fetch(`${API_BASE}/years`),
-          fetch(`${API_BASE}/assets`),
+          fetch(`${API_URL}/years`),
+          fetch(`${API_URL}/assets`),
         ]);
 
         const yearsJson = await yearsRes.json();
         const assetsJson = await assetsRes.json();
 
-        setYearsOptions(yearsJson.years || []);
-        setAssetsOptions(assetsJson.assets || []);
+        setYears(yearsJson.years || []);
+        setAssets(assetsJson.assets || []);
       } catch (err) {
-        console.error("Erreur loadFilters:", err);
+        console.error("Erreur chargement filtres", err);
       }
-    }
+    };
 
-    loadFilters();
+    fetchFilters();
   }, []);
 
-  // Récupération summary + transactions
-  async function refreshData() {
+  // Recharge summary + transactions quand filtres changent
+  useEffect(() => {
+    fetchSummaryAndTransactions();
+  }, [selectedYear, selectedAsset]);
+
+  const buildQueryString = () => {
+    const params = new URLSearchParams();
+    params.set("limit", "100");
+
+    if (selectedYear !== "all") {
+      params.set("year", String(selectedYear));
+    }
+    if (selectedAsset !== "all") {
+      params.set("asset", selectedAsset);
+    }
+
+    return params.toString();
+  };
+
+  const fetchSummaryAndTransactions = async () => {
+    const qs = buildQueryString();
+
     try {
       setLoading(true);
+      setLoadingSummary(true);
 
-      const params = new URLSearchParams();
-      if (year) params.set("year", year);
-      if (asset) params.set("asset", asset);
-
-      const [summaryRes, txRes] = await Promise.all([
-        fetch(`${API_BASE}/summary?` + params.toString()),
-        fetch(`${API_BASE}/transactions?limit=100&` + params.toString()),
+      const [txRes, sumRes] = await Promise.all([
+        fetch(`${API_URL}/transactions?${qs}`),
+        fetch(`${API_URL}/summary?${qs}`),
       ]);
 
-      const summaryJson = await summaryRes.json();
       const txJson = await txRes.json();
+      const sumJson = await sumRes.json();
 
-      setSummary(summaryJson);
       setTransactions(txJson || []);
+      setSummary(sumJson || summary);
     } catch (err) {
-      console.error("Erreur refreshData:", err);
+      console.error("Erreur fetch summary/transactions", err);
     } finally {
       setLoading(false);
+      setLoadingSummary(false);
     }
-  }
+  };
 
-  // premier chargement
-  useEffect(() => {
-    refreshData();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  // Upload CSV Binance
+  const handleFileChange = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploadError("");
+    setUploadSuccess("");
+
+    const formData = new FormData();
+    formData.append("file", file);
+
+    try {
+      setUploading(true);
+      const res = await fetch(`${API_URL}/import/binance`, {
+        method: "POST",
+        body: formData,
+      });
+
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`HTTP ${res.status} - ${text}`);
+      }
+
+      const json = await res.json();
+      setUploadSuccess(`${json.inserted || 0} lignes importées.`);
+      // On recharge les filtres + les données
+      await Promise.all([
+        (async () => {
+          const yearsRes = await fetch(`${API_URL}/years`);
+          const yearsJson = await yearsRes.json();
+          setYears(yearsJson.years || []);
+        })(),
+        (async () => {
+          const assetsRes = await fetch(`${API_URL}/assets`);
+          const assetsJson = await assetsRes.json();
+          setAssets(assetsJson.assets || []);
+        })(),
+      ]);
+
+      await fetchSummaryAndTransactions();
+    } catch (err) {
+      console.error(err);
+      setUploadError(err.message || "Erreur import CSV");
+    } finally {
+      setUploading(false);
+      // reset input
+      e.target.value = "";
+    }
+  };
+
+  const totalsCards = useMemo(() => {
+    return [
+      {
+        label: "Transactions totales",
+        value: summary.total_transactions,
+      },
+      {
+        label: "Achat (BUY)",
+        value: summary.total_buy,
+      },
+      {
+        label: "Vente (SELL)",
+        value: summary.total_sell,
+      },
+      {
+        label: "Dépôts",
+        value: summary.total_deposit,
+      },
+      {
+        label: "Retraits",
+        value: summary.total_withdrawal,
+      },
+    ];
+  }, [summary]);
 
   return (
-    <div
-      style={{
-        minHeight: "100vh",
-        background: "radial-gradient(circle at top, #0f172a 0, #020617 55%, #000 100%)",
-        color: "#f9fafb",
-        display: "flex",
-        fontFamily:
-          "-apple-system, BlinkMacSystemFont, system-ui, -apple-system, system-ui, sans-serif",
-      }}
-    >
-      {/* SIDEBAR */}
-      <aside
-        style={{
-          width: 230,
-          borderRight: "1px solid rgba(148,163,184,0.15)",
-          padding: "18px 16px",
-          display: "flex",
-          flexDirection: "column",
-          justifyContent: "space-between",
-          background:
-            "linear-gradient(to bottom, rgba(15,23,42,0.98), rgba(15,23,42,0.96), rgba(15,23,42,0.9))",
-        }}
-      >
-        <div>
-          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 24 }}>
-            <div
-              style={{
-                width: 28,
-                height: 28,
-                borderRadius: 999,
-                background: "conic-gradient(from 140deg, #22c55e, #22d3ee, #6366f1, #22c55e)",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                fontSize: 16,
-                fontWeight: 700,
-              }}
-            >
-              ₿
-            </div>
-            <div>
-              <div style={{ fontSize: 15, fontWeight: 600 }}>CryptoTax</div>
-              <div style={{ fontSize: 11, color: "#9ca3af" }}>Prototype perso</div>
-            </div>
+    <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 text-slate-100 flex">
+      {/* Sidebar */}
+      <aside className="w-64 border-r border-slate-800 bg-slate-950/80 backdrop-blur-xl hidden md:flex flex-col">
+        <div className="px-6 py-4 flex items-center gap-3 border-b border-slate-800">
+          <div className="h-9 w-9 rounded-xl bg-emerald-500/10 border border-emerald-400/40 flex items-center justify-center">
+            <span className="text-emerald-300 font-semibold text-lg">₿</span>
           </div>
-
-          <nav style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-            <div
-              style={{
-                padding: "8px 10px",
-                borderRadius: 8,
-                background: "rgba(148,163,184,0.12)",
-                border: "1px solid rgba(94,234,212,0.4)",
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "center",
-                fontSize: 13,
-              }}
-            >
-              <span>Tableau de bord</span>
-              <span
-                style={{
-                  fontSize: 10,
-                  padding: "2px 6px",
-                  borderRadius: 999,
-                  background: "rgba(16,185,129,0.15)",
-                  border: "1px solid rgba(52,211,153,0.6)",
-                  color: "#6ee7b7",
-                }}
-              >
-                BINANCE
-              </span>
+          <div>
+            <div className="text-sm font-semibold tracking-tight">
+              CryptoTax
             </div>
-
-            <div
-              style={{
-                padding: "8px 10px",
-                borderRadius: 8,
-                fontSize: 13,
-                color: "#6b7280",
-              }}
-            >
-              Transactions
-            </div>
-            <div
-              style={{
-                padding: "8px 10px",
-                borderRadius: 8,
-                fontSize: 13,
-                color: "#6b7280",
-              }}
-            >
-              Rapports fiscaux
-            </div>
-            <div
-              style={{
-                padding: "8px 10px",
-                borderRadius: 8,
-                fontSize: 13,
-                color: "#6b7280",
-              }}
-            >
-              Paramètres
-            </div>
-          </nav>
+            <div className="text-xs text-slate-400">Prototype perso</div>
+          </div>
         </div>
 
-        <div
-          style={{
-            marginTop: 24,
-            padding: "10px 10px",
-            borderRadius: 12,
-            background: "rgba(15,23,42,0.9)",
-            border: "1px solid rgba(148,163,184,0.35)",
-          }}
-        >
-          <div style={{ fontSize: 11, color: "#9ca3af", marginBottom: 4 }}>
-            ENV : <span style={{ color: "#22c55e" }}>DEV</span>
-          </div>
-          <div style={{ fontSize: 11, color: "#9ca3af" }}>Backend FastAPI sur NAS.</div>
+        <nav className="mt-4 px-3 space-y-1">
+          <button className="w-full flex items-center gap-2 px-3 py-2 text-sm rounded-lg bg-slate-800/80 text-slate-100">
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+            Tableau de bord
+          </button>
+          <button className="w-full flex items-center gap-2 px-3 py-2 text-sm rounded-lg text-slate-400 hover:bg-slate-800/40">
+            <span className="w-1.5 h-1.5 rounded-full bg-slate-500" />
+            Transactions
+          </button>
+          <button className="w-full flex items-center gap-2 px-3 py-2 text-sm rounded-lg text-slate-400 hover:bg-slate-800/40">
+            <span className="w-1.5 h-1.5 rounded-full bg-slate-500" />
+            Rapports fiscaux
+          </button>
+          <button className="w-full flex items-center gap-2 px-3 py-2 text-sm rounded-lg text-slate-400 hover:bg-slate-800/40">
+            <span className="w-1.5 h-1.5 rounded-full bg-slate-500" />
+            Paramètres
+          </button>
+        </nav>
+
+        <div className="mt-auto px-4 py-4 border-t border-slate-800 text-xs text-slate-500">
+          ENV: <span className="text-emerald-300">DEV</span> • Backend FastAPI
+          • React + Vite
         </div>
       </aside>
 
-      {/* MAIN */}
-      <main style={{ flex: 1, padding: "20px 28px 32px 28px", overflowX: "hidden" }}>
-        {/* HEADER */}
-        <header
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            marginBottom: 22,
-          }}
-        >
+      {/* Main */}
+      <main className="flex-1 px-4 md:px-10 py-6">
+        {/* Header */}
+        <header className="flex items-center justify-between mb-8">
           <div>
-            <h1 style={{ fontSize: 24, fontWeight: 600, marginBottom: 6 }}>
+            <h1 className="text-xl md:text-2xl font-semibold tracking-tight">
               Tax return – Binance
             </h1>
-            <p style={{ fontSize: 13, color: "#9ca3af" }}>
+            <p className="text-xs md:text-sm text-slate-400 mt-1">
               Prototype perso type Waltio. Front React + FastAPI sur ton NAS.
             </p>
           </div>
 
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 10,
-            }}
-          >
-            <div
-              style={{
-                fontSize: 11,
-                color: "#a3e635",
-                padding: "4px 8px",
-                borderRadius: 999,
-                border: "1px solid rgba(190,242,100,0.6)",
-                background: "rgba(26,86,219,0.15)",
-              }}
-            >
+          <div className="flex items-center gap-3">
+            <span className="hidden md:inline-flex items-center text-xs px-3 py-1 rounded-full bg-emerald-500/10 text-emerald-300 border border-emerald-500/30">
+              ENV: DEV
+            </span>
+            <span className="inline-flex items-center text-xs px-3 py-1 rounded-full bg-slate-800 border border-slate-700 text-slate-300">
               Année fiscale 2021+
-            </div>
+            </span>
           </div>
         </header>
 
-        {/* BARRE DE FILTRES */}
-        <section
-          style={{
-            marginBottom: 18,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: 12,
-          }}
-        >
-          <div
-            style={{
-              display: "flex",
-              alignItems: "flex-end",
-              gap: 16,
-              flexWrap: "wrap",
-            }}
-          >
-            {/* Année fiscale */}
-            <div>
-              <label
-                style={{
-                  display: "block",
-                  fontSize: 11,
-                  textTransform: "uppercase",
-                  letterSpacing: 0.04,
-                  color: "#9ca3af",
-                  marginBottom: 4,
-                }}
-              >
+        {/* Filtres haut */}
+        <section className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-6">
+          <div className="flex flex-wrap gap-3">
+            <div className="flex flex-col text-xs gap-1">
+              <span className="text-slate-400 uppercase tracking-wide">
                 Année fiscale
-              </label>
+              </span>
               <select
-                value={year}
-                onChange={(e) => setYear(e.target.value)}
-                style={{
-                  background: "rgba(15,23,42,0.9)",
-                  borderRadius: 999,
-                  border: "1px solid rgba(55,65,81,0.9)",
-                  padding: "6px 12px",
-                  fontSize: 13,
-                  minWidth: 110,
-                  color: "#e5e7eb",
-                }}
+                value={selectedYear}
+                onChange={(e) => setSelectedYear(e.target.value)}
+                className="bg-slate-900 border border-slate-700 text-sm rounded-lg px-3 py-2 text-slate-100 focus:outline-none focus:ring-1 focus:ring-emerald-400/60"
               >
-                <option value="">Toutes</option>
-                {yearsOptions.map((y) => (
+                <option value="all">Toutes</option>
+                {years.map((y) => (
                   <option key={y} value={y}>
                     {y}
                   </option>
@@ -341,250 +295,174 @@ function App() {
               </select>
             </div>
 
-            {/* Actif */}
-            <div>
-              <label
-                style={{
-                  display: "block",
-                  fontSize: 11,
-                  textTransform: "uppercase",
-                  letterSpacing: 0.04,
-                  color: "#9ca3af",
-                  marginBottom: 4,
-                }}
-              >
+            <div className="flex flex-col text-xs gap-1">
+              <span className="text-slate-400 uppercase tracking-wide">
                 Actif (BCH, BTC, USDT…)
-              </label>
+              </span>
               <select
-                value={asset}
-                onChange={(e) => setAsset(e.target.value)}
-                style={{
-                  background: "rgba(15,23,42,0.9)",
-                  borderRadius: 999,
-                  border: "1px solid rgba(55,65,81,0.9)",
-                  padding: "6px 12px",
-                  fontSize: 13,
-                  minWidth: 140,
-                  color: "#e5e7eb",
-                }}
+                value={selectedAsset}
+                onChange={(e) => setSelectedAsset(e.target.value)}
+                className="bg-slate-900 border border-slate-700 text-sm rounded-lg px-3 py-2 text-slate-100 focus:outline-none focus:ring-1 focus:ring-emerald-400/60 min-w-[150px]"
               >
-                <option value="">Tous</option>
-                {assetsOptions.map((a) => (
-                  <option key={a} value={a}>
-                    {a}
+                <option value="all">Tous</option>
+                {assets.map((asset) => (
+                  <option key={asset} value={asset}>
+                    {asset}
                   </option>
                 ))}
               </select>
             </div>
           </div>
 
-          {/* Bouton Mettre à jour */}
-          <button
-            onClick={refreshData}
-            style={{
-              padding: "8px 22px",
-              borderRadius: 999,
-              border: "none",
-              background:
-                "radial-gradient(circle at 10% 0%, #bbf7d0 0, #22c55e 30%, #22c55e 70%, #16a34a 100%)",
-              color: "#022c22",
-              fontSize: 13,
-              fontWeight: 600,
-              boxShadow: "0 0 20px rgba(34,197,94,0.4)",
-              cursor: "pointer",
-              whiteSpace: "nowrap",
-            }}
-          >
-            {loading ? "Chargement..." : "Mettre à jour"}
-          </button>
+          {/* Upload CSV */}
+          <div className="flex items-center gap-3">
+            <label className="relative inline-flex items-center justify-center px-4 py-2 rounded-full bg-emerald-500 hover:bg-emerald-400 text-sm font-medium text-slate-950 shadow-lg shadow-emerald-500/30 cursor-pointer transition">
+              {uploading ? "Import en cours..." : "Importer CSV Binance"}
+              <input
+                type="file"
+                accept=".csv"
+                className="absolute inset-0 opacity-0 cursor-pointer"
+                onChange={handleFileChange}
+                disabled={uploading}
+              />
+            </label>
+          </div>
         </section>
 
-        {/* SUMMARY CARDS */}
-        <section
-          style={{
-            display: "flex",
-            gap: 16,
-            flexWrap: "wrap",
-            marginBottom: 26,
-          }}
-        >
-          {[
-            {
-              label: "Transactions totales",
-              value: summary?.total_transactions ?? 0,
-            },
-            {
-              label: "Achat (BUY)",
-              value: summary?.total_buy ?? 0,
-            },
-            {
-              label: "Vente (SELL)",
-              value: summary?.total_sell ?? 0,
-            },
-            {
-              label: "Dépôts",
-              value: summary?.total_deposit ?? 0,
-            },
-            {
-              label: "Retraits",
-              value: summary?.total_withdrawal ?? 0,
-            },
-          ].map((card, idx) => (
+        {/* Messages upload */}
+        {(uploadError || uploadSuccess) && (
+          <div className="mb-4 text-xs">
+            {uploadError && (
+              <div className="px-3 py-2 rounded-md bg-red-500/10 border border-red-500/40 text-red-200 mb-1">
+                {uploadError}
+              </div>
+            )}
+            {uploadSuccess && (
+              <div className="px-3 py-2 rounded-md bg-emerald-500/10 border border-emerald-500/40 text-emerald-200">
+                {uploadSuccess}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Cards résumé */}
+        <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
+          {totalsCards.map((card) => (
             <div
-              key={idx}
-              style={{
-                flex: "0 0 200px",
-                maxWidth: 220,
-                background:
-                  "linear-gradient(to bottom right, rgba(15,23,42,0.9), rgba(15,23,42,0.95))",
-                borderRadius: 16,
-                padding: "10px 14px",
-                border: "1px solid rgba(31,41,55,0.9)",
-                boxShadow: "0 18px 40px rgba(15,23,42,0.85)",
-              }}
+              key={card.label}
+              className="rounded-2xl bg-gradient-to-br from-slate-900 to-slate-950 border border-slate-800 px-4 py-3 shadow-sm shadow-slate-900/60"
             >
-              <div
-                style={{
-                  fontSize: 11,
-                  textTransform: "uppercase",
-                  letterSpacing: 0.08,
-                  color: "#9ca3af",
-                  marginBottom: 4,
-                }}
-              >
+              <div className="text-[11px] uppercase tracking-wide text-slate-500 mb-1">
                 {card.label}
               </div>
-              <div style={{ fontSize: 20, fontWeight: 600 }}>
-                {formatNumber(card.value, 0)}
+              <div className="text-xl font-semibold tabular-nums text-slate-50">
+                {loadingSummary ? "…" : card.value}
               </div>
             </div>
           ))}
         </section>
 
-        {/* TABLEAU TRANSACTIONS */}
-        <section
-          style={{
-            background: "rgba(15,23,42,0.92)",
-            borderRadius: 18,
-            border: "1px solid rgba(31,41,55,0.95)",
-            boxShadow: "0 20px 45px rgba(15,23,42,0.95)",
-            overflow: "hidden",
-          }}
-        >
-          <div
-            style={{
-              padding: "10px 16px",
-              borderBottom: "1px solid rgba(31,41,55,0.9)",
-              display: "flex",
-              justifyContent: "space-between",
-              alignItems: "center",
-              fontSize: 12,
-              color: "#9ca3af",
-            }}
-          >
-            <div>Transactions récentes</div>
-            <div>Affichage des 100 dernières lignes</div>
+        {/* Tableau transactions */}
+        <section className="rounded-2xl bg-slate-950/70 border border-slate-800 shadow-xl shadow-black/50 overflow-hidden">
+          <div className="flex items-center justify-between px-4 py-3 border-b border-slate-800 text-xs text-slate-400">
+            <span>Transactions récentes</span>
+            <span>
+              Affichage des{" "}
+              <span className="text-slate-200 font-medium">
+                {transactions.length}
+              </span>{" "}
+              dernières lignes
+            </span>
           </div>
 
-          <div style={{ overflowX: "auto" }}>
-            <table
-              style={{
-                width: "100%",
-                borderCollapse: "collapse",
-                fontSize: 12,
-              }}
-            >
-              <thead
-                style={{
-                  background:
-                    "linear-gradient(to right, rgba(15,23,42,0.98), rgba(15,23,42,0.96))",
-                }}
-              >
-                <tr>
-                  <th style={thStyle}>Date</th>
-                  <th style={thStyle}>Type</th>
-                  <th style={thStyle}>Pair / Coin</th>
-                  <th style={thStyle}>Quantité</th>
-                  <th style={thStyle}>Prix EUR</th>
-                  <th style={thStyle}>Frais EUR</th>
-                  <th style={thStyle}>Note</th>
+          <div className="overflow-x-auto">
+            <table className="min-w-full text-xs">
+              <thead className="bg-slate-900/80 border-b border-slate-800">
+                <tr className="text-[11px] uppercase tracking-wide text-slate-500">
+                  <th className="px-4 py-2 text-left font-medium">Date</th>
+                  <th className="px-3 py-2 text-left font-medium">Type</th>
+                  <th className="px-3 py-2 text-left font-medium">Pair / Coin</th>
+                  <th className="px-3 py-2 text-right font-medium">Quantité</th>
+                  <th className="px-3 py-2 text-right font-medium">Prix EUR</th>
+                  <th className="px-3 py-2 text-right font-medium">Frais EUR</th>
+                  <th className="px-4 py-2 text-left font-medium">Note</th>
                 </tr>
               </thead>
               <tbody>
-                {transactions.length === 0 && (
+                {loading ? (
                   <tr>
                     <td
                       colSpan={7}
-                      style={{
-                        padding: "16px 18px",
-                        textAlign: "center",
-                        color: "#6b7280",
-                      }}
+                      className="px-4 py-6 text-center text-slate-500"
                     >
-                      Aucune transaction à afficher pour ces filtres.
+                      Chargement…
                     </td>
                   </tr>
-                )}
-
-                {transactions.map((tx) => {
-                  const sideLabel = mapSideToLabel(tx.side);
-                  const tagColor = mapSideToTagColor(tx.side);
-
-                  return (
-                    <tr
-                      key={tx.id}
-                      style={{
-                        borderTop: "1px solid rgba(31,41,55,0.85)",
-                        background:
-                          "radial-gradient(circle at top left, rgba(15,23,42,0.96), rgba(15,23,42,0.94))",
-                      }}
+                ) : transactions.length === 0 ? (
+                  <tr>
+                    <td
+                      colSpan={7}
+                      className="px-4 py-6 text-center text-slate-500"
                     >
-                      <td style={tdStyle}>{formatDate(tx.datetime)}</td>
+                      Aucune transaction pour ce filtre.
+                    </td>
+                  </tr>
+                ) : (
+                  transactions.map((tx) => {
+                    const sideUpper = (tx.side || "").toUpperCase();
+                    const badgeClass =
+                      TYPE_BADGE_COLORS[sideUpper] ||
+                      TYPE_BADGE_COLORS.OTHER;
 
-                      {/* Type avec badge couleur */}
-                      <td style={tdStyle}>
-                        <span
-                          style={{
-                            fontSize: 11,
-                            padding: "3px 8px",
-                            borderRadius: 999,
-                            border: `1px solid ${tagColor}`,
-                            color: tagColor,
-                            background: "rgba(15,23,42,0.9)",
-                          }}
-                        >
-                          {sideLabel}
-                        </span>
-                      </td>
-
-                      <td style={tdStyle}>{tx.pair}</td>
-                      <td style={{ ...tdStyle, textAlign: "right", fontVariantNumeric: "tabular-nums" }}>
-                        {formatNumber(tx.quantity)}
-                      </td>
-                      <td style={{ ...tdStyle, textAlign: "right", fontVariantNumeric: "tabular-nums" }}>
-                        {formatNumber(tx.price_eur, 2)}
-                      </td>
-                      <td style={{ ...tdStyle, textAlign: "right", fontVariantNumeric: "tabular-nums" }}>
-                        {formatNumber(tx.fees_eur, 4)}
-                      </td>
-                      <td style={{ ...tdStyle, maxWidth: 260 }}>
-                        <span
-                          style={{
-                            display: "inline-block",
-                            whiteSpace: "nowrap",
-                            overflow: "hidden",
-                            textOverflow: "ellipsis",
-                            maxWidth: 250,
-                            color: "#9ca3af",
-                          }}
-                          title={tx.note || ""}
-                        >
+                    return (
+                      <tr
+                        key={tx.id}
+                        className="border-b border-slate-900/60 hover:bg-slate-900/60 transition-colors"
+                      >
+                        <td className="px-4 py-2 text-slate-300 whitespace-nowrap">
+                          {formatDate(tx.datetime)}
+                        </td>
+                        <td className="px-3 py-2">
+                          <span
+                            className={classNames(
+                              "inline-flex items-center px-2.5 py-0.5 rounded-full text-[11px] font-medium",
+                              badgeClass
+                            )}
+                          >
+                            {formatSideLabel(sideUpper)}
+                          </span>
+                        </td>
+                        <td className="px-3 py-2 text-slate-200">
+                          {tx.pair || "—"}
+                        </td>
+                        <td className="px-3 py-2 text-right text-slate-200 tabular-nums">
+                          {tx.quantity?.toLocaleString("fr-FR", {
+                            maximumFractionDigits: 8,
+                          }) || "0"}
+                        </td>
+                        <td className="px-3 py-2 text-right text-slate-400 tabular-nums">
+                          {tx.price_eur
+                            ? tx.price_eur.toLocaleString("fr-FR", {
+                                minimumFractionDigits: 2,
+                                maximumFractionDigits: 2,
+                              })
+                            : "0,00"}
+                        </td>
+                        <td className="px-3 py-2 text-right text-slate-400 tabular-nums">
+                          {tx.fees_eur
+                            ? tx.fees_eur.toLocaleString("fr-FR", {
+                                minimumFractionDigits: 2,
+                                maximumFractionDigits: 2,
+                              })
+                            : "0,00"}
+                        </td>
+                        <td className="px-4 py-2 text-slate-400 max-w-xs truncate">
                           {tx.note || "—"}
-                        </span>
-                      </td>
-                    </tr>
-                  );
-                })}
+                        </td>
+                      </tr>
+                    );
+                  })
+                )}
               </tbody>
             </table>
           </div>
@@ -593,21 +471,5 @@ function App() {
     </div>
   );
 }
-
-// Styles de cellules pour le tableau
-const thStyle = {
-  textAlign: "left",
-  padding: "8px 14px",
-  fontWeight: 500,
-  color: "#9ca3af",
-  borderBottom: "1px solid rgba(31,41,55,0.9)",
-  whiteSpace: "nowrap",
-};
-
-const tdStyle = {
-  padding: "8px 14px",
-  color: "#e5e7eb",
-  whiteSpace: "nowrap",
-};
 
 export default App;
