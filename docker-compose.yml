@@ -16,7 +16,7 @@ services:
     container_name: cryptotax-backend
     working_dir: /app/backend
     volumes:
-      - ./:/app
+      - /data/compose/5:/app
     environment:
       DATABASE_URL: ${DATABASE_URL}
       BACKEND_PORT: ${BACKEND_PORT}
@@ -36,7 +36,7 @@ services:
     container_name: cryptotax-frontend
     working_dir: /app/frontend
     volumes:
-      - ./:/app
+      - /data/compose/5:/app
     environment:
       FRONTEND_PORT: ${FRONTEND_PORT}
     command: >
