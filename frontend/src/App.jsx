@@ -388,82 +388,114 @@ function App() {
                   <th className="px-4 py-2 text-left font-medium">Note</th>
                 </tr>
               </thead>
-              <tbody>
-                {loading ? (
-                  <tr>
-                    <td
-                      colSpan={7}
-                      className="px-4 py-6 text-center text-slate-500"
-                    >
-                      Chargement…
-                    </td>
-                  </tr>
-                ) : transactions.length === 0 ? (
-                  <tr>
-                    <td
-                      colSpan={7}
-                      className="px-4 py-6 text-center text-slate-500"
-                    >
-                      Aucune transaction pour ce filtre.
-                    </td>
-                  </tr>
-                ) : (
-                  transactions.map((tx) => {
-                    const sideUpper = (tx.side || "").toUpperCase();
-                    const badgeClass =
-                      TYPE_BADGE_COLORS[sideUpper] ||
-                      TYPE_BADGE_COLORS.OTHER;
+                <tbody>
+                  {loading ? (
+                    <tr>
+                      <td colSpan={7} className="px-4 py-6 text-center text-slate-500">
+                        Chargement…
+                      </td>
+                    </tr>
+                  ) : transactions.length === 0 ? (
+                    <tr>
+                      <td colSpan={7} className="px-4 py-6 text-center text-slate-500">
+                        Aucune transaction pour ce filtre.
+                      </td>
+                    </tr>
+                  ) : (
+                    transactions.map((tx) => {
+                      const sideUpper = (tx.side || "").toUpperCase();
+                      const badgeClass =
+                        TYPE_BADGE_COLORS[sideUpper] || TYPE_BADGE_COLORS.OTHER;
 
-                    return (
-                      <tr
-                        key={tx.id}
-                        className="border-b border-slate-900/60 hover:bg-slate-900/60 transition-colors"
-                      >
-                        <td className="px-4 py-2 text-slate-300 whitespace-nowrap">
-                          {formatDate(tx.datetime)}
-                        </td>
-                        <td className="px-3 py-2">
-                          <span
+                      // quantité : couleur selon signe
+                      const qtyNum = Number(tx.quantity || 0);
+                      const qtyColor =
+                        qtyNum > 0
+                          ? "text-emerald-300"
+                          : qtyNum < 0
+                          ? "text-red-300"
+                          : "text-slate-300";
+
+                      // formatage quantité (8 décimales max)
+                      const qtyStr = Number.isFinite(qtyNum)
+                        ? qtyNum.toLocaleString("fr-FR", {
+                            minimumFractionDigits: 0,
+                            maximumFractionDigits: 8,
+                          })
+                        : tx.quantity ?? "0";
+
+                      const priceNum = Number(tx.price_eur || 0);
+                      const feesNum = Number(tx.fees_eur || 0);
+
+                      const priceStr = priceNum.toLocaleString("fr-FR", {
+                        minimumFractionDigits: 2,
+                        maximumFractionDigits: 2,
+                      });
+
+                      const feesStr = feesNum.toLocaleString("fr-FR", {
+                        minimumFractionDigits: 2,
+                        maximumFractionDigits: 2,
+                      });
+
+                      return (
+                        <tr
+                          key={tx.id}
+                          className="border-b border-slate-900/60 hover:bg-slate-900/60 transition-colors"
+                        >
+                          {/* Date */}
+                          <td className="px-4 py-2 text-slate-300 whitespace-nowrap">
+                            {formatDate(tx.datetime)}
+                          </td>
+
+                          {/* Type badge */}
+                          <td className="px-3 py-2">
+                            <span
+                              className={classNames(
+                                "inline-flex items-center px-2.5 py-0.5 rounded-full text-[11px] font-medium",
+                                badgeClass
+                              )}
+                            >
+                              {formatSideLabel(sideUpper)}
+                            </span>
+                          </td>
+
+                          {/* Pair / Coin */}
+                          <td className="px-3 py-2 text-slate-200">
+                            {tx.pair || "—"}
+                          </td>
+
+                          {/* Quantité */}
+                          <td
                             className={classNames(
-                              "inline-flex items-center px-2.5 py-0.5 rounded-full text-[11px] font-medium",
-                              badgeClass
+                              "px-3 py-2 text-right tabular-nums",
+                              qtyColor
                             )}
                           >
-                            {formatSideLabel(sideUpper)}
-                          </span>
-                        </td>
-                        <td className="px-3 py-2 text-slate-200">
-                          {tx.pair || "—"}
-                        </td>
-                        <td className="px-3 py-2 text-right text-slate-200 tabular-nums">
-                          {tx.quantity?.toLocaleString("fr-FR", {
-                            maximumFractionDigits: 8,
-                          }) || "0"}
-                        </td>
-                        <td className="px-3 py-2 text-right text-slate-400 tabular-nums">
-                          {tx.price_eur
-                            ? tx.price_eur.toLocaleString("fr-FR", {
-                                minimumFractionDigits: 2,
-                                maximumFractionDigits: 2,
-                              })
-                            : "0,00"}
-                        </td>
-                        <td className="px-3 py-2 text-right text-slate-400 tabular-nums">
-                          {tx.fees_eur
-                            ? tx.fees_eur.toLocaleString("fr-FR", {
-                                minimumFractionDigits: 2,
-                                maximumFractionDigits: 2,
-                              })
-                            : "0,00"}
-                        </td>
-                        <td className="px-4 py-2 text-slate-400 max-w-xs truncate">
-                          {tx.note || "—"}
-                        </td>
-                      </tr>
-                    );
-                  })
-                )}
-              </tbody>
+                            {qtyStr}
+                          </td>
+
+                          {/* Prix EUR */}
+                          <td className="px-3 py-2 text-right text-slate-300 tabular-nums">
+                            {priceNum === 0 ? "0,00 €" : `${priceStr} €`}
+                          </td>
+
+                          {/* Frais EUR */}
+                          <td className="px-3 py-2 text-right text-slate-400 tabular-nums">
+                            {feesNum === 0 ? "0,00 €" : `${feesStr} €`}
+                          </td>
+
+                          {/* Note */}
+                          <td
+                            className="px-4 py-2 text-slate-400 max-w-xs truncate"
+                            title={tx.note || ""}
+                          >
+                            {tx.note || "—"}
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
             </table>
           </div>
         </section>
