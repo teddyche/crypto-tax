@@ -16,8 +16,8 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
-from db import Base, engine, SessionLocal
-from models import TransactionDB
+from .db import Base, engine, SessionLocal
+from .models import TransactionDB
 
 
 # -------------------------------------------------------------------
