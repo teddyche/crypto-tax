@@ -205,11 +205,13 @@ def list_transactions(
         offset: int = Query(0, ge=0),
         year: int | None = Query(None),
         asset: str | None = Query(None),
-        types: List[str] | None = Query(None),   # 👈 nouveau
+        types: List[str] | None = Query(None),
         db: Session = Depends(get_db),
 ):
     """
     Retourne les transactions filtrées, avec `side` NORMALISÉE.
+    La pagination est appliquée APRÈS filtrage par type pour ne pas
+    perdre les opérations rares (Convert, Earn, etc.).
     """
     query = db.query(TransactionDB)
 
@@ -219,19 +221,22 @@ def list_transactions(
     if asset:
         query = query.filter(TransactionDB.pair.ilike(f"%{asset}%"))
 
-    rows = (
-        query.order_by(TransactionDB.datetime.desc())
-        .offset(offset)
-        .limit(limit)
-        .all()
-    )
+    # 1. On récupère toutes les lignes correspondantes à année/asset
+    rows = query.order_by(TransactionDB.datetime.desc()).all()
 
+    # 2. Filtre par type (sur la version normalisée)
     if types:
         allowed = {t.upper() for t in types}
         rows = [tx for tx in rows if normalize_side(tx) in allowed]
 
+    # 3. Pagination manuelle
+    start = offset
+    end = offset + limit
+    page_rows = rows[start:end]
+
+    # 4. Sérialisation
     out: list[TransactionOut] = []
-    for tx in rows:
+    for tx in page_rows:
         normalized = normalize_side(tx)
         out.append(
             TransactionOut(
