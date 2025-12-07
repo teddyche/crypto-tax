@@ -107,18 +107,32 @@ def get_db():
 
 # ---------- Helpers de normalisation Binance ----------
 def normalize_side(tx: TransactionDB) -> str:
+    """
+    Normalise le field `side` pour l'affichage et les stats.
+    On garde :
+      - BUY / SELL
+      - DEPOSIT / WITHDRAWAL
+      - CONVERT
+      - INCOME (revenu Earn)
+      - SUBSCRIPTION (mise en Earn)
+      - OTHER
+    """
     raw = (tx.side or "").upper().strip()
     note = (tx.note or "").lower()
 
-    # INCOME = on l'affiche comme un DEPOT (revenus/earn)
-    if raw == "INCOME":
-        return "DEPOSIT"
-
-    # Cas déjà propres
-    if raw in {"BUY", "SELL", "DEPOSIT", "WITHDRAWAL"}:
+    # Cas déjà propres (inclut INCOME & SUBSCRIPTION)
+    if raw in {
+        "BUY",
+        "SELL",
+        "DEPOSIT",
+        "WITHDRAWAL",
+        "CONVERT",
+        "INCOME",
+        "SUBSCRIPTION",
+    }:
         return raw
 
-    # Buy Crypto With Fiat -> BUY (tu voulais ça)
+    # Buy Crypto With Fiat -> BUY
     if "buy crypto with fiat" in note:
         return "BUY"
 
@@ -128,9 +142,8 @@ def normalize_side(tx: TransactionDB) -> str:
     if "deposit" in note:
         return "DEPOSIT"
 
-    # Convert : plein de variantes Binance
+    # Convert : variantes bizarres Binance
     if "convert" in note or raw in {
-        "CONVERT",
         "TRANSACTION SPEND",
         "TRANSACTION BUY",
         "TRANSACTION FEE",
@@ -411,6 +424,17 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
             })
             continue
 
+        # Simple Earn : subscription (sortie vers Earn, neutre fiscalement)
+        if "SIMPLE EARN FLEXIBLE SUBSCRIPTION" in op_upper:
+            simple_rows.append({
+                "datetime": dt,
+                "side": "SUBSCRIPTION",
+                "pair": coin,
+                "quantity": qty,  # négatif, c'est ok
+                "note": f"{account} | {remark}".strip(" |"),
+            })
+            continue
+
         # EARN / INCOME : Binance Earn, Simple Earn, Staking, Launchpool, etc.
         if ("EARN" in remark_upper
             or "SIMPLE EARN" in remark_upper
@@ -552,9 +576,6 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
         elif to_asset and not from_asset:
             # Achat direct depuis fiat
             side = "BUY"
-
-        if "SIMPLE EARN" in op_upper:
-            pair = coin
 
         tx = TransactionDB(
             datetime=dt,

@@ -57,6 +57,7 @@ const TYPE_FILTERS = [
   { value: "WITHDRAWAL", label: "Retrait" },
   { value: "CONVERT", label: "Convert" },
   { value: "INCOME", label: "Revenu" },
+  { value: "SUBSCRIPTION", label: "Subscription (Earn)" },
   { value: "OTHER", label: "Autre" },
 ];
 
