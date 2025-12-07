@@ -14,5 +14,4 @@ data/
 *.db
 
 # Secrets & env
-.env
 .env.*
