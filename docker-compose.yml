@@ -19,17 +19,11 @@ services:
       - /data/compose/5:/app
     environment:
       DATABASE_URL: ${DATABASE_URL}
-      BACKEND_PORT: ${BACKEND_PORT}
     command: >
       bash -c "
-        echo '=== LS /app ===' &&
-        ls -R /app &&
-        echo '=== PWD ===' &&
-        pwd &&
         pip install --upgrade pip &&
         pip install -r /app/backend/requirements.txt &&
-        cd /app/backend &&
-        uvicorn app.main:app --host 0.0.0.0 --port ${BACKEND_PORT}
+        uvicorn app.main:app --host 0.0.0.0 --port 8010
       "
     ports:
       - "8010:8010"
@@ -42,17 +36,11 @@ services:
     working_dir: /app/frontend
     volumes:
       - /data/compose/5:/app
-    environment:
-      FRONTEND_PORT: ${FRONTEND_PORT}
     command: >
       sh -c "
-        echo '=== LS /app ===' &&
-        ls -R /app &&
-        echo '=== PWD ===' &&
-        pwd &&
         cd /app/frontend &&
         npm install &&
-        npm run dev -- --host 0.0.0.0 --port ${FRONTEND_PORT}
+        npm run dev -- --host 0.0.0.0 --port 3010
       "
     ports:
       - "3010:3010"
