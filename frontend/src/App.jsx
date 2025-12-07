@@ -1,6 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
 
-// Tu peux mettre ça dans un .env plus tard
 const API_URL = import.meta.env.VITE_API_URL || "http://192.168.1.69:8010";
 
 function formatDate(dateStr) {
@@ -25,6 +24,7 @@ const TYPE_BADGE_COLORS = {
   DEPOSIT: "bg-sky-500/10 text-sky-300 border border-sky-500/30",
   WITHDRAWAL: "bg-orange-500/10 text-orange-300 border border-orange-500/30",
   CONVERT: "bg-violet-500/10 text-violet-300 border border-violet-500/30",
+  INCOME: "bg-amber-500/10 text-amber-300 border border-amber-500/30",
   OTHER: "bg-slate-500/10 text-slate-300 border border-slate-500/30",
 };
 
@@ -40,10 +40,22 @@ function formatSideLabel(side) {
       return "Retrait";
     case "CONVERT":
       return "Convert";
+    case "INCOME":
+      return "Revenu";
     default:
       return "Autre";
   }
 }
+
+const TYPE_FILTERS = [
+  { value: "BUY", label: "Achat" },
+  { value: "SELL", label: "Vente" },
+  { value: "DEPOSIT", label: "Dépôt" },
+  { value: "WITHDRAWAL", label: "Retrait" },
+  { value: "CONVERT", label: "Convert" },
+  { value: "INCOME", label: "Revenu" },
+  { value: "OTHER", label: "Autre" },
+];
 
 function App() {
   const [transactions, setTransactions] = useState([]);
@@ -53,6 +65,7 @@ function App() {
     total_sell: 0,
     total_deposit: 0,
     total_withdrawal: 0,
+    total_convert: 0,
   });
 
   const [loading, setLoading] = useState(false);
@@ -61,41 +74,18 @@ function App() {
   // Filtres
   const [years, setYears] = useState([]);
   const [assets, setAssets] = useState([]);
-
   const [selectedYear, setSelectedYear] = useState("all");
   const [selectedAsset, setSelectedAsset] = useState("all");
+
+  // Filtre de type (multi)
+  const [selectedTypes, setSelectedTypes] = useState([]);
 
   // Upload
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState("");
   const [uploadSuccess, setUploadSuccess] = useState("");
 
-  // Charge les années / actifs au démarrage
-  useEffect(() => {
-    const fetchFilters = async () => {
-      try {
-        const [yearsRes, assetsRes] = await Promise.all([
-          fetch(`${API_URL}/years`),
-          fetch(`${API_URL}/assets`),
-        ]);
-
-        const yearsJson = await yearsRes.json();
-        const assetsJson = await assetsRes.json();
-
-        setYears(yearsJson.years || []);
-        setAssets(assetsJson.assets || []);
-      } catch (err) {
-        console.error("Erreur chargement filtres", err);
-      }
-    };
-
-    fetchFilters();
-  }, []);
-
-  // Recharge summary + transactions quand filtres changent
-  useEffect(() => {
-    fetchSummaryAndTransactions();
-  }, [selectedYear, selectedAsset]);
+  // --- Helpers filtres ---
 
   const buildQueryString = () => {
     const params = new URLSearchParams();
@@ -107,8 +97,60 @@ function App() {
     if (selectedAsset !== "all") {
       params.set("asset", selectedAsset);
     }
+    if (selectedTypes.length > 0) {
+      selectedTypes.forEach((t) => params.append("types", t));
+    }
 
     return params.toString();
+  };
+
+  const fetchFilters = async () => {
+    try {
+      const paramsYears = new URLSearchParams();
+      const paramsAssets = new URLSearchParams();
+
+      if (selectedAsset !== "all") {
+        paramsYears.set("asset", selectedAsset);
+      }
+      if (selectedYear !== "all") {
+        paramsAssets.set("year", String(selectedYear));
+      }
+
+      const [yearsRes, assetsRes] = await Promise.all([
+        fetch(
+          `${API_URL}/years${
+            paramsYears.toString() ? "?" + paramsYears.toString() : ""
+          }`
+        ),
+        fetch(
+          `${API_URL}/assets${
+            paramsAssets.toString() ? "?" + paramsAssets.toString() : ""
+          }`
+        ),
+      ]);
+
+      const yearsJson = await yearsRes.json();
+      const assetsJson = await assetsRes.json();
+
+      const newYears = yearsJson.years || [];
+      const newAssets = assetsJson.assets || [];
+
+      setYears(newYears);
+      setAssets(newAssets);
+
+      // Si l'année / l'actif sélectionné disparaît, on reset sur "all"
+      if (selectedYear !== "all" && !newYears.includes(Number(selectedYear))) {
+        setSelectedYear("all");
+      }
+      if (
+        selectedAsset !== "all" &&
+        !newAssets.includes(String(selectedAsset))
+      ) {
+        setSelectedAsset("all");
+      }
+    } catch (err) {
+      console.error("Erreur chargement filtres", err);
+    }
   };
 
   const fetchSummaryAndTransactions = async () => {
@@ -127,7 +169,16 @@ function App() {
       const sumJson = await sumRes.json();
 
       setTransactions(txJson || []);
-      setSummary(sumJson || summary);
+      setSummary(
+        sumJson || {
+          total_transactions: 0,
+          total_buy: 0,
+          total_sell: 0,
+          total_deposit: 0,
+          total_withdrawal: 0,
+          total_convert: 0,
+        }
+      );
     } catch (err) {
       console.error("Erreur fetch summary/transactions", err);
     } finally {
@@ -136,7 +187,28 @@ function App() {
     }
   };
 
-  // Upload CSV Binance
+  // --- useEffects ---
+
+  // Au mount : charge filtres + données globales
+  useEffect(() => {
+    (async () => {
+      await fetchFilters();
+      await fetchSummaryAndTransactions();
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Quand les filtres changent : recharge filtres croisés + données
+  useEffect(() => {
+    (async () => {
+      await fetchFilters();
+      await fetchSummaryAndTransactions();
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedYear, selectedAsset, selectedTypes]);
+
+  // --- Upload CSV Binance ---
+
   const handleFileChange = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -160,30 +232,19 @@ function App() {
 
       const json = await res.json();
       setUploadSuccess(`${json.inserted || 0} lignes importées.`);
-      // On recharge les filtres + les données
-      await Promise.all([
-        (async () => {
-          const yearsRes = await fetch(`${API_URL}/years`);
-          const yearsJson = await yearsRes.json();
-          setYears(yearsJson.years || []);
-        })(),
-        (async () => {
-          const assetsRes = await fetch(`${API_URL}/assets`);
-          const assetsJson = await assetsRes.json();
-          setAssets(assetsJson.assets || []);
-        })(),
-      ]);
 
+      await fetchFilters();
       await fetchSummaryAndTransactions();
     } catch (err) {
       console.error(err);
       setUploadError(err.message || "Erreur import CSV");
     } finally {
       setUploading(false);
-      // reset input
       e.target.value = "";
     }
   };
+
+  // --- UI helpers ---
 
   const totalsCards = useMemo(() => {
     return [
@@ -207,8 +268,24 @@ function App() {
         label: "Retraits",
         value: summary.total_withdrawal,
       },
+      {
+        label: "Conversions (CONVERT)",
+        value: summary.total_convert,
+      },
     ];
   }, [summary]);
+
+  const toggleType = (value) => {
+    setSelectedTypes((prev) =>
+      prev.includes(value)
+        ? prev.filter((v) => v !== value)
+        : [...prev, value]
+    );
+  };
+
+  const clearTypes = () => setSelectedTypes([]);
+
+  // --- Render ---
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 text-slate-100 flex">
@@ -276,46 +353,89 @@ function App() {
 
         {/* Filtres haut */}
         <section className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-6">
-          <div className="flex flex-wrap gap-3">
-            <div className="flex flex-col text-xs gap-1">
-              <span className="text-slate-400 uppercase tracking-wide">
-                Année fiscale
-              </span>
-              <select
-                value={selectedYear}
-                onChange={(e) => setSelectedYear(e.target.value)}
-                className="bg-slate-900 border border-slate-700 text-sm rounded-lg px-3 py-2 text-slate-100 focus:outline-none focus:ring-1 focus:ring-emerald-400/60"
-              >
-                <option value="all">Toutes</option>
-                {years.map((y) => (
-                  <option key={y} value={y}>
-                    {y}
-                  </option>
-                ))}
-              </select>
+          <div className="flex flex-col gap-3">
+            <div className="flex flex-wrap gap-3">
+              {/* Année */}
+              <div className="flex flex-col text-xs gap-1">
+                <span className="text-slate-400 uppercase tracking-wide">
+                  Année fiscale
+                </span>
+                <select
+                  value={selectedYear}
+                  onChange={(e) => setSelectedYear(e.target.value)}
+                  className="bg-slate-900 border border-slate-700 text-sm rounded-lg px-3 py-2 text-slate-100 focus:outline-none focus:ring-1 focus:ring-emerald-400/60"
+                >
+                  <option value="all">Toutes</option>
+                  {years.map((y) => (
+                    <option key={y} value={y}>
+                      {y}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Actif */}
+              <div className="flex flex-col text-xs gap-1">
+                <span className="text-slate-400 uppercase tracking-wide">
+                  Actif (BCH, BTC, USDT…)
+                </span>
+                <select
+                  value={selectedAsset}
+                  onChange={(e) => setSelectedAsset(e.target.value)}
+                  className="bg-slate-900 border border-slate-700 text-sm rounded-lg px-3 py-2 text-slate-100 focus:outline-none focus:ring-1 focus:ring-emerald-400/60 min-w-[150px]"
+                >
+                  <option value="all">Tous</option>
+                  {assets.map((asset) => (
+                    <option key={asset} value={asset}>
+                      {asset}
+                    </option>
+                  ))}
+                </select>
+              </div>
             </div>
 
+            {/* Types */}
             <div className="flex flex-col text-xs gap-1">
               <span className="text-slate-400 uppercase tracking-wide">
-                Actif (BCH, BTC, USDT…)
+                Types d&apos;opération
               </span>
-              <select
-                value={selectedAsset}
-                onChange={(e) => setSelectedAsset(e.target.value)}
-                className="bg-slate-900 border border-slate-700 text-sm rounded-lg px-3 py-2 text-slate-100 focus:outline-none focus:ring-1 focus:ring-emerald-400/60 min-w-[150px]"
-              >
-                <option value="all">Tous</option>
-                {assets.map((asset) => (
-                  <option key={asset} value={asset}>
-                    {asset}
-                  </option>
-                ))}
-              </select>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={clearTypes}
+                  className={classNames(
+                    "px-3 py-1 rounded-full text-[11px] border transition",
+                    selectedTypes.length === 0
+                      ? "bg-emerald-500/20 border-emerald-400 text-emerald-100"
+                      : "bg-slate-900 border-slate-600 text-slate-300 hover:border-slate-400"
+                  )}
+                >
+                  Tous
+                </button>
+                {TYPE_FILTERS.map((t) => {
+                  const active = selectedTypes.includes(t.value);
+                  return (
+                    <button
+                      key={t.value}
+                      type="button"
+                      onClick={() => toggleType(t.value)}
+                      className={classNames(
+                        "px-3 py-1 rounded-full text-[11px] border transition",
+                        active
+                          ? "bg-slate-100 text-slate-900 border-slate-100"
+                          : "bg-slate-900 border-slate-600 text-slate-300 hover:border-slate-400"
+                      )}
+                    >
+                      {t.label}
+                    </button>
+                  );
+                })}
+              </div>
             </div>
           </div>
 
           {/* Upload CSV */}
-          <div className="flex items-center gap-3">
+          <div className="flex items-start gap-3">
             <label className="relative inline-flex items-center justify-center px-4 py-2 rounded-full bg-emerald-500 hover:bg-emerald-400 text-sm font-medium text-slate-950 shadow-lg shadow-emerald-500/30 cursor-pointer transition">
               {uploading ? "Import en cours..." : "Importer CSV Binance"}
               <input
@@ -346,7 +466,7 @@ function App() {
         )}
 
         {/* Cards résumé */}
-        <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
+        <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-4 mb-6">
           {totalsCards.map((card) => (
             <div
               key={card.label}
@@ -381,121 +501,91 @@ function App() {
                 <tr className="text-[11px] uppercase tracking-wide text-slate-500">
                   <th className="px-4 py-2 text-left font-medium">Date</th>
                   <th className="px-3 py-2 text-left font-medium">Type</th>
-                  <th className="px-3 py-2 text-left font-medium">Pair / Coin</th>
+                  <th className="px-3 py-2 text-left font-medium">
+                    Pair / Coin
+                  </th>
                   <th className="px-3 py-2 text-right font-medium">Quantité</th>
                   <th className="px-3 py-2 text-right font-medium">Prix EUR</th>
                   <th className="px-3 py-2 text-right font-medium">Frais EUR</th>
                   <th className="px-4 py-2 text-left font-medium">Note</th>
                 </tr>
               </thead>
-                <tbody>
-                  {loading ? (
-                    <tr>
-                      <td colSpan={7} className="px-4 py-6 text-center text-slate-500">
-                        Chargement…
-                      </td>
-                    </tr>
-                  ) : transactions.length === 0 ? (
-                    <tr>
-                      <td colSpan={7} className="px-4 py-6 text-center text-slate-500">
-                        Aucune transaction pour ce filtre.
-                      </td>
-                    </tr>
-                  ) : (
-                    transactions.map((tx) => {
-                      const sideUpper = (tx.side || "").toUpperCase();
-                      const badgeClass =
-                        TYPE_BADGE_COLORS[sideUpper] || TYPE_BADGE_COLORS.OTHER;
+              <tbody>
+                {loading ? (
+                  <tr>
+                    <td
+                      colSpan={7}
+                      className="px-4 py-6 text-center text-slate-500"
+                    >
+                      Chargement…
+                    </td>
+                  </tr>
+                ) : transactions.length === 0 ? (
+                  <tr>
+                    <td
+                      colSpan={7}
+                      className="px-4 py-6 text-center text-slate-500"
+                    >
+                      Aucune transaction pour ce filtre.
+                    </td>
+                  </tr>
+                ) : (
+                  transactions.map((tx) => {
+                    const sideUpper = (tx.side || "").toUpperCase();
+                    const badgeClass =
+                      TYPE_BADGE_COLORS[sideUpper] ||
+                      TYPE_BADGE_COLORS.OTHER;
 
-                      // quantité : couleur selon signe
-                      const qtyNum = Number(tx.quantity || 0);
-                      const qtyColor =
-                        qtyNum > 0
-                          ? "text-emerald-300"
-                          : qtyNum < 0
-                          ? "text-red-300"
-                          : "text-slate-300";
-
-                      // formatage quantité (8 décimales max)
-                      const qtyStr = Number.isFinite(qtyNum)
-                        ? qtyNum.toLocaleString("fr-FR", {
-                            minimumFractionDigits: 0,
-                            maximumFractionDigits: 8,
-                          })
-                        : tx.quantity ?? "0";
-
-                      const priceNum = Number(tx.price_eur || 0);
-                      const feesNum = Number(tx.fees_eur || 0);
-
-                      const priceStr = priceNum.toLocaleString("fr-FR", {
-                        minimumFractionDigits: 2,
-                        maximumFractionDigits: 2,
-                      });
-
-                      const feesStr = feesNum.toLocaleString("fr-FR", {
-                        minimumFractionDigits: 2,
-                        maximumFractionDigits: 2,
-                      });
-
-                      return (
-                        <tr
-                          key={tx.id}
-                          className="border-b border-slate-900/60 hover:bg-slate-900/60 transition-colors"
-                        >
-                          {/* Date */}
-                          <td className="px-4 py-2 text-slate-300 whitespace-nowrap">
-                            {formatDate(tx.datetime)}
-                          </td>
-
-                          {/* Type badge */}
-                          <td className="px-3 py-2">
-                            <span
-                              className={classNames(
-                                "inline-flex items-center px-2.5 py-0.5 rounded-full text-[11px] font-medium",
-                                badgeClass
-                              )}
-                            >
-                              {formatSideLabel(sideUpper)}
-                            </span>
-                          </td>
-
-                          {/* Pair / Coin */}
-                          <td className="px-3 py-2 text-slate-200">
-                            {tx.pair || "—"}
-                          </td>
-
-                          {/* Quantité */}
-                          <td
+                    return (
+                      <tr
+                        key={tx.id}
+                        className="border-b border-slate-900/60 hover:bg-slate-900/60 transition-colors"
+                      >
+                        <td className="px-4 py-2 text-slate-300 whitespace-nowrap">
+                          {formatDate(tx.datetime)}
+                        </td>
+                        <td className="px-3 py-2">
+                          <span
                             className={classNames(
-                              "px-3 py-2 text-right tabular-nums",
-                              qtyColor
+                              "inline-flex items-center px-2.5 py-0.5 rounded-full text-[11px] font-medium",
+                              badgeClass
                             )}
                           >
-                            {qtyStr}
-                          </td>
-
-                          {/* Prix EUR */}
-                          <td className="px-3 py-2 text-right text-slate-300 tabular-nums">
-                            {priceNum === 0 ? "0,00 €" : `${priceStr} €`}
-                          </td>
-
-                          {/* Frais EUR */}
-                          <td className="px-3 py-2 text-right text-slate-400 tabular-nums">
-                            {feesNum === 0 ? "0,00 €" : `${feesStr} €`}
-                          </td>
-
-                          {/* Note */}
-                          <td
-                            className="px-4 py-2 text-slate-400 max-w-xs truncate"
-                            title={tx.note || ""}
-                          >
-                            {tx.note || "—"}
-                          </td>
-                        </tr>
-                      );
-                    })
-                  )}
-                </tbody>
+                            {formatSideLabel(sideUpper)}
+                          </span>
+                        </td>
+                        <td className="px-3 py-2 text-slate-200">
+                          {tx.pair || "—"}
+                        </td>
+                        <td className="px-3 py-2 text-right text-slate-200 tabular-nums">
+                          {tx.quantity?.toLocaleString("fr-FR", {
+                            maximumFractionDigits: 8,
+                          }) || "0"}
+                        </td>
+                        <td className="px-3 py-2 text-right text-slate-400 tabular-nums">
+                          {tx.price_eur
+                            ? tx.price_eur.toLocaleString("fr-FR", {
+                                minimumFractionDigits: 2,
+                                maximumFractionDigits: 2,
+                              }) + " €"
+                            : "0,00 €"}
+                        </td>
+                        <td className="px-3 py-2 text-right text-slate-400 tabular-nums">
+                          {tx.fees_eur
+                            ? tx.fees_eur.toLocaleString("fr-FR", {
+                                minimumFractionDigits: 2,
+                                maximumFractionDigits: 2,
+                              }) + " €"
+                            : "0,00 €"}
+                        </td>
+                        <td className="px-4 py-2 text-slate-400 max-w-xs truncate">
+                          {tx.note || "—"}
+                        </td>
+                      </tr>
+                    );
+                  })
+                )}
+              </tbody>
             </table>
           </div>
         </section>

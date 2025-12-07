@@ -86,6 +86,7 @@ class SummaryOut(BaseModel):
     total_sell: int
     total_deposit: int
     total_withdrawal: int
+    total_convert: int
 
 
 # ---------- DB utils ----------
@@ -143,37 +144,39 @@ async def health():
 # ---------- Filtres disponibles (années / actifs) ----------
 
 @app.get("/years")
-def list_years(db: Session = Depends(get_db)):
-    """
-    Retourne la liste des années présentes dans les transactions.
-    Format attendu par le front : {"years": [2021, 2022, ...]}
-    """
+def list_years(
+        asset: str | None = Query(None),
+        db: Session = Depends(get_db),
+):
+    query = db.query(func.extract("year", TransactionDB.datetime).label("y"))
+    if asset:
+        query = query.filter(TransactionDB.pair.ilike(f"%{asset}%"))
+
     years = (
-        db.query(func.extract("year", TransactionDB.datetime).label("y"))
-        .distinct()
+        query.distinct()
         .order_by("y")
         .all()
     )
-    # years = [(2021.0,), (2022.0,)...] → on cast en int
     years_int = [int(row.y) for row in years if row.y is not None]
     return {"years": years_int}
 
 
 @app.get("/assets")
-def list_assets(db: Session = Depends(get_db)):
-    """
-    Retourne la liste des actifs (pair/coin) distincts.
-    Format attendu : {"assets": ["BCH", "USDT", ...]}
-    """
+def list_assets(
+        year: int | None = Query(None),
+        db: Session = Depends(get_db),
+):
+    query = db.query(TransactionDB.pair)
+    if year is not None:
+        query = query.filter(func.extract("year", TransactionDB.datetime) == year)
+
     rows = (
-        db.query(TransactionDB.pair)
-        .distinct()
+        query.distinct()
         .order_by(TransactionDB.pair.asc())
         .all()
     )
     assets = [row.pair for row in rows if row.pair]
     return {"assets": assets}
-
 
 # ---------- Transactions & summary ----------
 
@@ -183,6 +186,7 @@ def list_transactions(
         offset: int = Query(0, ge=0),
         year: int | None = Query(None),
         asset: str | None = Query(None),
+        types: List[str] | None = Query(None),   # 👈 nouveau
         db: Session = Depends(get_db),
 ):
     """
@@ -202,6 +206,10 @@ def list_transactions(
         .limit(limit)
         .all()
     )
+
+    if types:
+        allowed = {t.upper() for t in types}
+        rows = [tx for tx in rows if normalize_side(tx) in allowed]
 
     out: list[TransactionOut] = []
     for tx in rows:
@@ -226,6 +234,7 @@ def list_transactions(
 def get_summary(
         year: int | None = Query(None),
         asset: str | None = Query(None),
+        types: List[str] | None = Query(None),   # 👈
         db: Session = Depends(get_db),
 ):
     """
@@ -242,8 +251,12 @@ def get_summary(
 
     rows = query.all()
 
+    if types:
+        allowed = {t.upper() for t in types}
+        rows = [tx for tx in rows if normalize_side(tx) in allowed]
+
     total = len(rows)
-    total_buy = total_sell = total_deposit = total_withdrawal = 0
+    total_buy = total_sell = total_deposit = total_withdrawal = total_convert = 0
 
     for tx in rows:
         s = normalize_side(tx)
@@ -255,6 +268,8 @@ def get_summary(
             total_deposit += 1
         elif s == "WITHDRAWAL":
             total_withdrawal += 1
+        elif s == "CONVERT":
+            total_convert += 1
 
     return SummaryOut(
         total_transactions=total,
@@ -262,6 +277,7 @@ def get_summary(
         total_sell=total_sell,
         total_deposit=total_deposit,
         total_withdrawal=total_withdrawal,
+        total_convert=total_convert,
     )
 
 
