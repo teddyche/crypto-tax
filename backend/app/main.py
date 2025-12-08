@@ -1,9 +1,11 @@
 from datetime import datetime, date, timedelta
-from typing import List, Optional, Literal
-import requests
+from typing import List, Optional
 import csv
 from io import StringIO
+import re
+from collections import defaultdict
 
+import requests
 from fastapi import FastAPI, Depends, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -12,36 +14,31 @@ from sqlalchemy.orm import Session
 
 from .db import Base, engine, SessionLocal
 from .models import TransactionDB, FXRate, CoinMeta, CoinPrice
+from xml.etree import ElementTree as ET
 
-import re
+# ===================== Constantes / regex =====================
 
 DIRECTION_RE = re.compile(
     r"From\s+([-\d\.]+)\s+([A-Z0-9]+)\s+->\s+([-\d\.]+)\s+([A-Z0-9]+)"
 )
 
-# ---------- CryptoCurrencyChart API (historique de prix) ----------
-
 CCC_API_KEY = "912f4971567ad6da574774b52bdd0a5f"
 CCC_API_SECRET = "7cb5e29e15306be715942b8675383e74"
 CCC_BASE_URL = "https://www.cryptocurrencychart.com/api"
 
-TAXABLE_OUT_SYMS = {"EUR", "USDT", "USDC"}
 FIAT_SYMS = {"EUR", "USD"}
 STABLE_SYMS = {"USDT", "USDC", "BUSD", "TUSD", "FDUSD"}
+TAX_BASE = FIAT_SYMS | STABLE_SYMS  # tout ce qui compte comme "cash" pour l'imposition
 
-TAX_BASE = FIAT_SYMS | STABLE_SYMS  # ce qui compte comme "cash" pour l'imposition
+# ===================== Helpers FX / prix =====================
 
 def is_fiat_or_stable(symbol: str) -> bool:
     s = (symbol or "").upper()
     return s in FIAT_SYMS or s in STABLE_SYMS
 
-def get_usd_eur_rate(db: Session, dt: datetime) -> float:
-    """
-    Retourne le taux USD->EUR pour la date de la transaction.
-    S'il n'y a pas de taux exact ce jour-là, on prend le plus récent avant.
-    """
-    d = dt.date()
 
+def get_usd_eur_rate(db: Session, dt: datetime) -> float:
+    d = dt.date()
     rate_obj = (
         db.query(FXRate)
         .filter(
@@ -52,19 +49,10 @@ def get_usd_eur_rate(db: Session, dt: datetime) -> float:
         .order_by(FXRate.date.desc())
         .first()
     )
+    return rate_obj.rate if rate_obj else 1.0
 
-    if rate_obj is None:
-        # fallback au cas où la table est vide
-        return 1.0
-
-    return rate_obj.rate
-
-from sqlalchemy import func
 
 def ccc_get(path: str):
-    """
-    Appel générique à l'API CCC avec auth basic (clé + secret).
-    """
     url = f"{CCC_BASE_URL}{path}"
     r = requests.get(url, auth=(CCC_API_KEY, CCC_API_SECRET), timeout=15)
     r.raise_for_status()
@@ -72,14 +60,7 @@ def ccc_get(path: str):
 
 
 def get_or_create_coin_meta(db: Session, symbol: str) -> CoinMeta | None:
-    """
-    Récupère (ou crée) le mapping symbol -> id CCC.
-    Retourne None si le symbole n'existe pas chez CCC
-    (ou si c'est un fiat/stable type USDT, EUR).
-    """
     symbol = (symbol or "").upper()
-
-    # Fiat / stables : on ne va pas chez CCC, on gère à part
     if is_fiat_or_stable(symbol):
         return None
 
@@ -87,7 +68,6 @@ def get_or_create_coin_meta(db: Session, symbol: str) -> CoinMeta | None:
     if meta:
         return meta
 
-    # Appel /coin/list une fois, on cherche par symbol
     data = ccc_get("/coin/list")
     coins = data.get("coins", [])
 
@@ -98,7 +78,6 @@ def get_or_create_coin_meta(db: Session, symbol: str) -> CoinMeta | None:
             break
 
     if not match:
-        # Pas connu chez CCC
         return None
 
     meta = CoinMeta(
@@ -114,9 +93,6 @@ def get_or_create_coin_meta(db: Session, symbol: str) -> CoinMeta | None:
 
 
 def fetch_history_chunk(coin_id: int, start: date, end: date, base_currency: str = "USD"):
-    """
-    Récupère l'historique journaliers pour [start, end] (max 2 ans).
-    """
     path = f"/coin/history/{coin_id}/{start}/{end}/price/{base_currency}"
     return ccc_get(path)
 
@@ -128,24 +104,16 @@ def ensure_coin_history(
         end_date: date,
         base_currency: str = "USD",
 ):
-    """
-    S'assure qu'on a les prix journaliers pour `symbol` sur [start_date, end_date].
-    Ne télécharge que ce qui manque.
-    """
     symbol = (symbol or "").upper()
-
-    # Fiat / stables : rien à faire
     if is_fiat_or_stable(symbol):
         return
 
     meta = get_or_create_coin_meta(db, symbol)
     if not meta:
-        # Coin pas dispo chez CCC
         return
 
     base_currency = "USD"
 
-    # Ce qu'on a déjà
     existing_min, existing_max = db.query(
         func.min(CoinPrice.date),
         func.max(CoinPrice.date),
@@ -156,7 +124,6 @@ def ensure_coin_history(
 
     cur = start_date
     if existing_max is not None:
-        # On ne redemande que ce qui est après ce qu'on a déjà
         cur = max(cur, existing_max + timedelta(days=1))
 
     if cur > end_date:
@@ -167,7 +134,6 @@ def ensure_coin_history(
             cur.replace(year=cur.year + 2) - timedelta(days=1),
             end_date,
             )
-
         payload = fetch_history_chunk(meta.api_id, cur, chunk_end, base_currency)
         for d in payload.get("data", []):
             day = date.fromisoformat(d["date"])
@@ -178,23 +144,17 @@ def ensure_coin_history(
                 base=base_currency,
                 price=price,
             )
-            # merge = insert or update
             db.merge(cp)
-
         db.commit()
         cur = chunk_end + timedelta(days=1)
 
 
 def get_coin_price_usd(db: Session, symbol: str, dt: datetime) -> float | None:
-    """
-    Retourne le prix 1 coin -> USD pour ce jour (ou le plus récent avant).
-    """
     symbol = (symbol or "").upper()
 
-    if symbol in {"USD", "USDT", "USDC", "BUSD", "TUSD", "FDUSD"}:
+    if symbol in STABLE_SYMS or symbol == "USD":
         return 1.0
     if symbol == "EUR":
-        # prix “en USD” pour l'EUR : 1 / fx (si on voulait)
         return None
 
     d = dt.date()
@@ -210,52 +170,29 @@ def get_coin_price_usd(db: Session, symbol: str, dt: datetime) -> float | None:
     )
     return row.price if row else None
 
-def map_operation_to_side(operation: str, quantity: float) -> str:
-    op = (operation or "").upper()
+# ===================== DB / FastAPI setup =====================
 
-    # 1. Commissions / rewards
-    if "REFERRER COMMISSION" in op or "COMMISSION HISTORY" in op:
-        # On les traite comme des dépôts / rewards entrants
-        return "DEPOSIT"
-
-    # 2. Dépôts / retraits classiques
-    if op.startswith("DEPOSIT"):
-        return "DEPOSIT"
-    if op.startswith("WITHDRAW"):
-        return "WITHDRAWAL"
-
-    if "SIMPLE EARN FLEXIBLE INTEREST" in op:
-        return "INCOME"  # réel revenu
-
-    if "SIMPLE EARN FLEXIBLE SUBSCRIPTION" in op:
-        return "SUBSCRIPTION"  # immobilisation
-
-    # 3. Conversions, spend/buy, etc. (selon ce qu’on avait déjà)
-    if "BINANCE CONVERT" in op or op == "CONVERT":
-        return "CONVERT"
-
-    # 4. Fallback générique
-    if quantity > 0:
-        return "BUY"
-    if quantity < 0:
-        return "SELL"
-    return "OTHER"
-
-# Création des tables
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="CryptoTax API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # à restreindre plus tard
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ---------- Pydantic models ----------
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# ===================== Pydantic models =====================
 
 class TransactionOut(BaseModel):
     id: int
@@ -268,14 +205,12 @@ class TransactionOut(BaseModel):
     fees_eur: float | None = None
     note: str | None = None
 
-    # Imposition & direction
     taxable: bool
     direction: str | None = None
 
-    # 🆕 Champs fiscaux détaillés (peuvent être None si non imposable)
-    pv_eur: float | None = None              # PV de la ligne
-    cum_pv_year_eur: float | None = None     # PV cumulée de l'année
-    estimated_tax_eur: float | None = None   # = max(cum_pv_year, 0) * 0.30
+    pv_eur: float | None = None
+    cum_pv_year_eur: float | None = None
+    estimated_tax_eur: float | None = None
 
     class Config:
         from_attributes = True
@@ -300,6 +235,7 @@ class SummaryOut(BaseModel):
     total_withdrawal: int
     total_convert: int
 
+
 class TaxEventOut(BaseModel):
     id: int
     datetime: datetime
@@ -318,10 +254,12 @@ class TaxYearOut(BaseModel):
     flat_tax_30: float
     events: List[TaxEventOut]
 
+
 class PositionOut(BaseModel):
     symbol: str
     quantity: float
     value_eur: float
+
 
 class DailyPortfolioOut(BaseModel):
     date: date
@@ -329,31 +267,41 @@ class DailyPortfolioOut(BaseModel):
     daily_pnl_eur: float
     positions: List[PositionOut]
 
-# ---------- DB utils ----------
+# ===================== Portfolio / normalisation =====================
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+def normalize_side(tx: TransactionDB) -> str:
+    raw = (tx.side or "").upper().strip()
+    note = (tx.note or "").lower()
 
-import re
-from collections import defaultdict
+    if "convert" in note or raw in {
+        "CONVERT",
+        "TRANSACTION SPEND",
+        "TRANSACTION BUY",
+        "TRANSACTION FEE",
+    }:
+        return "CONVERT"
+
+    if raw == "INCOME":
+        return "DEPOSIT"
+
+    if raw in {"BUY", "SELL", "DEPOSIT", "WITHDRAWAL"}:
+        return raw
+
+    if "buy crypto with fiat" in note:
+        return "BUY"
+
+    if "withdraw" in note:
+        return "WITHDRAWAL"
+    if "deposit" in note:
+        return "DEPOSIT"
+
+    if raw in {"SUBSCRIPTION", "EARN_RETURN"}:
+        return "HIDDEN"
+
+    return "OTHER"
+
 
 def compute_daily_portfolio(db: Session, year: int | None = None) -> list[DailyPortfolioOut]:
-    """
-    Reconstruit le portefeuille jour par jour à partir des transactions.
-
-    Hypothèses :
-      - On travaille en scope "Binance only" (ce que voit la DB).
-      - BUY / DEPOSIT / INCOME augmentent la quantité de l'asset.
-      - SELL / WITHDRAWAL la réduisent.
-      - CONVERT : on parse le note "From X BTC -> Y BCH" pour décrémenter X et
-        incrémenter Y (sinon on ignore le from, fallback ≈ BUY).
-    """
-
-    # 1. On récupère toutes les transactions dans l’ordre chronologique
     query = db.query(TransactionDB)
     if year is not None:
         query = query.filter(func.extract("year", TransactionDB.datetime) == year)
@@ -362,8 +310,7 @@ def compute_daily_portfolio(db: Session, year: int | None = None) -> list[DailyP
     if not txs:
         return []
 
-    # 2. On prépare
-    holdings: dict[str, float] = defaultdict(float)  # quantité par coin
+    holdings: dict[str, float] = defaultdict(float)
     by_day: dict[date, list[TransactionDB]] = defaultdict(list)
 
     for tx in txs:
@@ -372,39 +319,31 @@ def compute_daily_portfolio(db: Session, year: int | None = None) -> list[DailyP
 
     all_days = sorted(by_day.keys())
     results: list[DailyPortfolioOut] = []
-
     prev_total_value = 0.0
 
     for d in all_days:
         day_txs = by_day[d]
-        net_flow_eur = 0.0  # flux "externe" du jour (EUR qui rentre/sort)
+        net_flow_eur = 0.0
 
-        # 3. On applique les transactions du jour sur les holdings
         for tx in day_txs:
             side = normalize_side(tx)
             pair = (tx.pair or "").upper()
             qty = tx.quantity or 0.0
 
-            # a) flux externes en EUR pour le PnL
             if pair == "EUR" and side in {"DEPOSIT", "WITHDRAWAL"}:
                 if side == "DEPOSIT":
                     net_flow_eur += abs(tx.price_eur or 0.0)
                 else:
                     net_flow_eur -= abs(tx.price_eur or 0.0)
 
-            # b) mise à jour des quantités crypto
             if pair == "EUR" or is_fiat_or_stable(pair):
-                # on ne stocke pas EUR/USDT/... dans les holdings de l’onglet portfolio
                 continue
 
             if side in {"BUY", "DEPOSIT", "INCOME"}:
                 holdings[pair] += abs(qty)
-
             elif side in {"SELL", "WITHDRAWAL"}:
                 holdings[pair] -= abs(qty)
-
             elif side == "CONVERT":
-                # On essaye de parser le FROM/TO depuis le note
                 note = tx.note or ""
                 m = re.search(
                     r"From\s+([\-0-9\.]+)\s+([A-Z0-9]+)\s*->\s*([\-0-9\.]+)\s+([A-Z0-9]+)",
@@ -421,23 +360,18 @@ def compute_daily_portfolio(db: Session, year: int | None = None) -> list[DailyP
                     if not is_fiat_or_stable(to_sym) and to_sym != "EUR":
                         holdings[to_sym] += abs(to_amount)
                 else:
-                    # fallback : on considère juste que c’est un BUY du pair
                     holdings[pair] += abs(qty)
 
-        # 4. Valorisation du portefeuille ce jour-là
         day_total_value = 0.0
         positions_out: list[PositionOut] = []
-
         day_dt = datetime.combine(d, datetime.min.time())
 
         for sym, q in list(holdings.items()):
-            # on nettoie les positions quasi-nulles
             if abs(q) < 1e-12:
                 holdings.pop(sym, None)
                 continue
 
             if is_fiat_or_stable(sym) or sym == "EUR":
-                # l’onglet portfolio = seulement les coins "vrais"
                 continue
 
             price_usd = get_coin_price_usd(db, sym, day_dt)
@@ -457,8 +391,6 @@ def compute_daily_portfolio(db: Session, year: int | None = None) -> list[DailyP
             )
 
         positions_out.sort(key=lambda p: -abs(p.value_eur))
-
-        # 5. PnL du jour (approx) : variation de valeur - flux net EUR
         daily_pnl = day_total_value - (prev_total_value + net_flow_eur)
         prev_total_value = day_total_value
 
@@ -473,64 +405,9 @@ def compute_daily_portfolio(db: Session, year: int | None = None) -> list[DailyP
 
     return results
 
-# ---------- Helpers de normalisation Binance ----------
-def normalize_side(tx: TransactionDB) -> str:
-    """
-    Normalise le field `side` pour l'affichage et les stats.
-
-    On garde uniquement :
-      - BUY
-      - SELL
-      - DEPOSIT
-      - WITHDRAWAL
-      - CONVERT
-      - OTHER
-
-    Quelques règles :
-      - INCOME = affiché comme DEPOT (earn, intérêts…)
-      - Toute opé qui ressemble à un CONVERT passe en CONVERT,
-        même si le side brut est "BUY" ou "SELL".
-    """
-    raw = (tx.side or "").upper().strip()
-    note = (tx.note or "").lower()
-
-    # 1. CONVERT en priorité (même si side brut = BUY/SELL)
-    if "convert" in note or raw in {
-        "CONVERT",
-        "TRANSACTION SPEND",
-        "TRANSACTION BUY",
-        "TRANSACTION FEE",
-    }:
-        return "CONVERT"
-
-    # 2. INCOME (earn / intérêts) → affiché comme DEPOT
-    if raw == "INCOME":
-        return "DEPOSIT"
-
-    # 3. Cas déjà propres
-    if raw in {"BUY", "SELL", "DEPOSIT", "WITHDRAWAL"}:
-        return raw
-
-    # 4. Buy Crypto With Fiat -> BUY
-    if "buy crypto with fiat" in note:
-        return "BUY"
-
-    # 5. Withdraw / Deposit détectés dans la note
-    if "withdraw" in note:
-        return "WITHDRAWAL"
-    if "deposit" in note:
-        return "DEPOSIT"
-
-    # 6. Flux Earn internes : on les CACHE
-    if raw in {"SUBSCRIPTION", "EARN_RETURN"}:
-        return "HIDDEN"
-
-    return "OTHER"
+# ===================== Imposition =====================
 
 def extract_from_to(tx: TransactionDB) -> tuple[str | None, str | None]:
-    """
-    Extrait (from_asset, to_asset) depuis la note "From X COIN -> Y COIN2".
-    """
     m = DIRECTION_RE.search(tx.note or "")
     if not m:
         return None, None
@@ -541,14 +418,8 @@ def extract_from_to(tx: TransactionDB) -> tuple[str | None, str | None]:
 
 def is_taxable(tx: TransactionDB) -> bool:
     """
-    Imposable = on sort de la crypto vers une "monnaie" considérée comme cash :
-    - EUR
-    - stablecoins en USD (USDT, USDC, BUSD, TUSD, FDUSD)
-
-    Règle :
-    - on ne regarde QUE les opérations normalisées en SELL ou CONVERT
-    - on considère imposable quand on *termine* dans TAX_BASE (EUR / stable)
-      via le couple "From X COIN -> Y CASH" dans la note.
+    Imposable = on sort d'une vraie crypto vers du "cash" (EUR / stables USD).
+    On ne regarde que SELL / CONVERT.
     """
     s = normalize_side(tx)
     if s not in {"SELL", "CONVERT"}:
@@ -556,38 +427,17 @@ def is_taxable(tx: TransactionDB) -> bool:
 
     from_asset, to_asset = extract_from_to(tx)
 
-    # Cas principal : on a bien un "From ... -> ..."
     if from_asset or to_asset:
-        # Imposable si on termine dans du cash (EUR, USDT, USDC, ...)
         return (to_asset or "").upper() in TAX_BASE
 
-    # Fallback ultra simple : pas de note, mais pair = cash (rare)
     pair = (tx.pair or "").upper()
     if s == "SELL" and pair in TAX_BASE:
         return True
 
     return False
 
-from collections import defaultdict
 
 def compute_tax_events_all_years(db: Session) -> dict[int, dict]:
-    """
-    Calcule les événements fiscaux (SELL vers EUR / stables) sur tout l'historique,
-    en méthode "prix moyen" par actif.
-
-    Retourne un dict:
-        { tx_id: {
-            "id": ...,
-            "datetime": ...,
-            "pair": <asset vendu>,
-            "side": "SELL",
-            "proceeds_eur": ...,
-            "pv_eur": ...,                  # PV de la ligne
-            "cum_pv_year_eur": ...,         # PV cumulée de l'année après cette ligne
-            "estimated_tax_eur": ...        # max(cum_pv_year, 0) * 0.30
-        }}
-    """
-
     txs = (
         db.query(TransactionDB)
         .order_by(TransactionDB.datetime.asc())
@@ -597,7 +447,6 @@ def compute_tax_events_all_years(db: Session) -> dict[int, dict]:
     holdings_qty: dict[str, float] = defaultdict(float)
     holdings_cost: dict[str, float] = defaultdict(float)
     cum_pv_by_year: dict[int, float] = defaultdict(float)
-
     events_by_id: dict[int, dict] = {}
 
     for tx in txs:
@@ -607,10 +456,10 @@ def compute_tax_events_all_years(db: Session) -> dict[int, dict]:
             continue
 
         qty = tx.quantity or 0.0
-        trade_value = tx.price_eur or 0.0  # valeur totale en EUR (pas prix unitaire)
+        trade_value = tx.price_eur or 0.0
         year = tx.datetime.year
 
-        # ----- acquisitions dans le pool (on ne track que les vraies cryptos) -----
+        # acquisitions crypto (hors cash)
         if side in {"BUY", "DEPOSIT", "INCOME"} and asset not in TAX_BASE:
             if qty < 0:
                 qty = -qty
@@ -618,7 +467,7 @@ def compute_tax_events_all_years(db: Session) -> dict[int, dict]:
             holdings_cost[asset] += abs(trade_value)
             continue
 
-        # ----- évènements imposables : SELL vers EUR / stables -----
+        # évènements imposables : SELL vers cash
         if side == "SELL" and is_taxable(tx) and asset not in TAX_BASE:
             if qty > 0:
                 qty = -qty
@@ -626,23 +475,17 @@ def compute_tax_events_all_years(db: Session) -> dict[int, dict]:
 
             prev_qty = holdings_qty[asset]
             prev_cost = holdings_cost[asset]
-
-            if prev_qty > 0:
-                unit_cost = prev_cost / prev_qty
-            else:
-                unit_cost = 0.0  # pas d'historique → on considère coût nul
+            unit_cost = prev_cost / prev_qty if prev_qty > 0 else 0.0
 
             cost_out = unit_cost * qty_sold
             proceeds = abs(trade_value)
             pv = proceeds - cost_out
 
-            # mise à jour de la position
             new_qty = max(prev_qty - qty_sold, 0.0)
             new_cost = max(prev_cost - cost_out, 0.0)
             holdings_qty[asset] = new_qty
             holdings_cost[asset] = new_cost
 
-            # cumul annuel
             cum_pv_by_year[year] += pv
             cum_pv_year = cum_pv_by_year[year]
             est_tax = max(cum_pv_year, 0.0) * 0.30
@@ -658,17 +501,10 @@ def compute_tax_events_all_years(db: Session) -> dict[int, dict]:
                 "estimated_tax_eur": est_tax,
             }
 
-            continue
-
-        # tout le reste (WITHDRAWAL, CONVERT crypto/crypto, OTHER, ...) ne change pas la fiscalité
-        continue
-
     return events_by_id
 
+
 def get_direction_label(tx: TransactionDB) -> str | None:
-    """
-    Texte "Vers/Depuis" pour affichage UI.
-    """
     s = normalize_side(tx)
     from_asset, to_asset = extract_from_to(tx)
 
@@ -680,14 +516,12 @@ def get_direction_label(tx: TransactionDB) -> str | None:
         return f"{from_asset} → {to_asset}"
     return None
 
-# ---------- Routes simples ----------
+# ===================== Routes =====================
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
-
-# ---------- Filtres disponibles (années / actifs) ----------
 
 @app.get("/years")
 def list_years(
@@ -698,11 +532,7 @@ def list_years(
     if asset:
         query = query.filter(TransactionDB.pair.ilike(f"%{asset}%"))
 
-    years = (
-        query.distinct()
-        .order_by("y")
-        .all()
-    )
+    years = query.distinct().order_by("y").all()
     years_int = [int(row.y) for row in years if row.y is not None]
     return {"years": years_int}
 
@@ -716,15 +546,10 @@ def list_assets(
     if year is not None:
         query = query.filter(func.extract("year", TransactionDB.datetime) == year)
 
-    rows = (
-        query.distinct()
-        .order_by(TransactionDB.pair.asc())
-        .all()
-    )
+    rows = query.distinct().order_by(TransactionDB.pair.asc()).all()
     assets = [row.pair for row in rows if row.pair]
     return {"assets": assets}
 
-# ---------- Transactions & summary ----------
 
 @app.get("/transactions", response_model=List[TransactionOut])
 def list_transactions(
@@ -735,11 +560,6 @@ def list_transactions(
         types: List[str] | None = Query(None),
         db: Session = Depends(get_db),
 ):
-    """
-    Retourne les transactions filtrées, avec `side` NORMALISÉE.
-    La pagination est appliquée APRÈS filtrage par type pour ne pas
-    perdre les opérations rares (Convert, Earn, etc.).
-    """
     query = db.query(TransactionDB)
 
     if year is not None:
@@ -748,31 +568,26 @@ def list_transactions(
     if asset:
         query = query.filter(TransactionDB.pair.ilike(f"%{asset}%"))
 
-    # 1. On récupère toutes les lignes correspondantes à année/asset
     rows = query.order_by(TransactionDB.datetime.desc()).all()
 
     normalized_rows = []
     for tx in rows:
         side_norm = normalize_side(tx)
-        if side_norm == "HIDDEN":  # 👈 ON CACHE
+        if side_norm == "HIDDEN":
             continue
         normalized_rows.append(tx)
     rows = normalized_rows
 
-    # 2. Filtre par type (sur la version normalisée)
     if types:
         allowed = {t.upper() for t in types}
         rows = [tx for tx in rows if normalize_side(tx) in allowed]
 
-    # 3. Pagination manuelle
     start = offset
     end = offset + limit
     page_rows = rows[start:end]
 
-    # 🆕 map des évènements fiscaux (PV / taxe) par id
     tax_events = compute_tax_events_all_years(db)
 
-    # 4. Sérialisation
     out: list[TransactionOut] = []
     for tx in page_rows:
         normalized = normalize_side(tx)
@@ -791,24 +606,25 @@ def list_transactions(
                 note=tx.note,
                 taxable=is_taxable(tx),
                 direction=get_direction_label(tx),
-                pv_eur=tax_info["pv_eur"] if tax_info else None,
-                cum_pv_year_eur=tax_info["cum_pv_year_eur"] if tax_info else None,
-                estimated_tax_eur=tax_info["estimated_tax_eur"] if tax_info else None,
+                pv_eur=(tax_info["pv_eur"] if tax_info else None),
+                cum_pv_year_eur=(
+                    tax_info["cum_pv_year_eur"] if tax_info else None
+                ),
+                estimated_tax_eur=(
+                    tax_info["estimated_tax_eur"] if tax_info else None
+                ),
             )
         )
     return out
+
 
 @app.get("/summary", response_model=SummaryOut)
 def get_summary(
         year: int | None = Query(None),
         asset: str | None = Query(None),
-        types: List[str] | None = Query(None),   # 👈
+        types: List[str] | None = Query(None),
         db: Session = Depends(get_db),
 ):
-    """
-    Summary basé sur les `side` normalisés (BUY/SELL/DEPOSIT/WITHDRAWAL).
-    Les CONVERT restent en dehors du comptage buy/sell pour l'instant.
-    """
     query = db.query(TransactionDB)
 
     if year is not None:
@@ -848,26 +664,17 @@ def get_summary(
         total_convert=total_convert,
     )
 
+
 @app.get("/portfolio/daily", response_model=List[DailyPortfolioOut])
 def get_daily_portfolio(
         year: int | None = Query(None),
         db: Session = Depends(get_db),
 ):
-    """
-    Time-series du portefeuille (Binance seulement), valorisé en EUR par jour.
-    Utilisable pour :
-      - graphe de valeur totale jour par jour
-      - breakdown par asset à la date sélectionnée
-      - PnL journalier approximatif
-    """
     return compute_daily_portfolio(db, year=year)
+
 
 @app.get("/tax/{year}")
 def compute_tax(year: int, db: Session = Depends(get_db)):
-    """
-    Utilise le même calcul que pour les évènements ligne par ligne,
-    mais agrégé sur l'année demandée.
-    """
     events_by_id = compute_tax_events_all_years(db)
 
     year_events = [
@@ -878,7 +685,6 @@ def compute_tax(year: int, db: Session = Depends(get_db)):
     total_pv_eur = sum(e["pv_eur"] for e in year_events)
     flat_tax_30 = max(total_pv_eur, 0.0) * 0.30
 
-    # On renvoie les events au format historique que tu utilises déjà
     events_out = [
         {
             "id": e["id"],
@@ -898,7 +704,7 @@ def compute_tax(year: int, db: Session = Depends(get_db)):
         "events": events_out,
     }
 
-# ---------- Création manuelle ----------
+# ===================== CRUD simple =====================
 
 @app.post("/transactions", response_model=TransactionOut)
 def create_transaction(tx: TransactionIn, db: Session = Depends(get_db)):
@@ -927,39 +733,22 @@ def create_transaction(tx: TransactionIn, db: Session = Depends(get_db)):
         price_eur=tx_db.price_eur,
         fees_eur=tx_db.fees_eur,
         note=tx_db.note,
+        taxable=is_taxable(tx_db),
+        direction=get_direction_label(tx_db),
     )
 
-
-# ---------- Import Binance (vite fait) ----------
-
-from collections import defaultdict
+# ===================== Import Binance =====================
 
 @app.post("/import/binance")
 async def import_binance(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    """
-    Import avancé du CSV 'Transactions' de Binance.
-    On reconstruit des opérations logiques à partir des lignes brutes :
-      - Deposit / Withdraw
-      - Transaction Spend / Buy / Fee (Convert, achat, etc.)
-      - Earn / Staking / Rewards -> INCOME
-
-    Avant de parser, on scanne le fichier pour :
-      - récupérer la liste des coins utilisés
-      - la plage de dates min/max
-      - pré-remplir l'historique de prix CCC pour chaque coin
-    """
-
     content = await file.read()
     s = content.decode("utf-8", errors="ignore")
 
-    # Détection séparateur , ou ;
     sample = s[:2048]
     dialect = csv.Sniffer().sniff(sample, delimiters=",;")
 
-    # On bufferise toutes les rows pour pouvoir faire 2 passes
     rows = list(csv.DictReader(StringIO(s), dialect=dialect))
 
-    # --- Scan des assets + min/max dates ---
     assets: set[str] = set()
     min_date: date | None = None
     max_date: date | None = None
@@ -990,24 +779,21 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
         if coin:
             assets.add(coin.upper())
 
-    # Si on a des dates valides, on précharge les historiques de prix
     if min_date is not None and max_date is not None:
         for sym in assets:
             ensure_coin_history(db, sym, min_date, max_date, base_currency="USD")
-
-    # --- Parsing “réel” des transactions maintenant que les prix sont en base ---
 
     composed_ops: dict[str, dict] = defaultdict(lambda: {
         "datetime": None,
         "account": None,
         "remark": None,
-        "spends": [],   # [ (coin, amount) ]
-        "buys": [],     # [ (coin, amount) ]
-        "fees": [],     # [ (coin, amount) ]
-        "raw_ops": [],  # debug / traçabilité
+        "spends": [],
+        "buys": [],
+        "fees": [],
+        "raw_ops": [],
     })
 
-    simple_rows: list[dict] = []  # deposits, withdrawals, income simples
+    simple_rows: list[dict] = []
 
     for row in rows:
         utc_time = (row.get("UTC_Time")
@@ -1024,7 +810,6 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
         if not utc_time or not operation:
             continue
 
-        # Parse date
         try:
             dt = datetime.strptime(utc_time, "%Y-%m-%d %H:%M:%S")
         except ValueError:
@@ -1033,7 +818,6 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
             except Exception:
                 continue
 
-        # Quantité float
         try:
             qty = float(str(change_str).replace(",", "."))
         except ValueError:
@@ -1042,8 +826,8 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
         op_upper = operation.upper()
         remark_upper = remark.upper()
 
-        # --- Cas simples : DEPOSIT / WITHDRAW / EARN (INCOME) ---
-        if op_upper == "FIAT DEPOSIT" or op_upper == "DEPOSIT":
+        # ---------- Cas simples ----------
+        if op_upper in {"FIAT DEPOSIT", "DEPOSIT"}:
             simple_rows.append({
                 "datetime": dt,
                 "side": "DEPOSIT",
@@ -1067,7 +851,6 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
             })
             continue
 
-        # Simple Earn Flexible Redemption  → transfert interne (non taxable)
         if "SIMPLE EARN FLEXIBLE REDEMPTION" in op_upper:
             simple_rows.append({
                 "datetime": dt,
@@ -1080,7 +863,6 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
             })
             continue
 
-        # Simple Earn : subscription (sortie vers Earn, neutre fiscalement)
         if "SIMPLE EARN FLEXIBLE SUBSCRIPTION" in op_upper:
             simple_rows.append({
                 "datetime": dt,
@@ -1091,7 +873,6 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
             })
             continue
 
-        # EARN / INCOME
         if ("EARN" in remark_upper
             or "SIMPLE EARN" in remark_upper
             or "STAKING" in remark_upper
@@ -1106,13 +887,12 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
             })
             continue
 
-        # --- Binance Convert (2 lignes : +asset et -asset) ---
+        # ---------- Binance Convert ----------
         if operation == "Binance Convert":
             bucket = dt.strftime("%Y-%m-%d %H:%M")
             group_key = f"{account}|{bucket}|BINANCE_CONVERT"
 
             comp = composed_ops[group_key]
-
             if comp["datetime"] is None or dt > comp["datetime"]:
                 comp["datetime"] = dt
 
@@ -1124,10 +904,9 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
                 comp["spends"].append((coin, qty))
             elif qty > 0:
                 comp["buys"].append((coin, qty))
-
             continue
 
-        # --- Cas composés : Transaction Spend / Buy / Fee / etc. ---
+        # ---------- Cas composés (Transaction Spend / Revenue / Fee / ...) ----------
         group_key = f"{account}|{dt.strftime('%Y-%m-%d %H:%M:%S')}|{remark}"
 
         comp = composed_ops[group_key]
@@ -1138,29 +917,24 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
 
         op_u = operation.upper()
 
-        op_u = operation.upper()
-
-    # PATCH : reclassification des lignes composées
-    if "TRANSACTION REVENUE" in op_u:
-        # C'est ce que tu REÇOIS (USDT, EUR...) -> jambe "to"
-        comp["buys"].append((coin, abs(qty)))
-    elif "SPEND" in op_u or "SOLD" in op_u or op_u == "SELL":
-        # Ce que tu VENDS -> jambe "from"
-        comp["spends"].append((coin, qty))
-    elif "BUY" in op_u:
-        # Cas "Transaction Buy" classique
-        comp["buys"].append((coin, qty))
-    elif "FEE" in op_u:
-        comp["fees"].append((coin, qty))
-    else:
-        comp["buys"].append((coin, qty))
-        comp["raw_ops"].append(f"FALLBACK_OTHER:{operation}")
+        if "TRANSACTION REVENUE" in op_u:
+            # ce que tu reçois (USDT, EUR, ...)
+            comp["buys"].append((coin, abs(qty)))
+        elif "SPEND" in op_u or "SOLD" in op_u or op_u == "SELL":
+            # ce que tu vends (LUNA, NEO, ...)
+            comp["spends"].append((coin, qty))  # qty déjà négatif
+        elif "BUY" in op_u:
+            comp["buys"].append((coin, qty))
+        elif "FEE" in op_u:
+            comp["fees"].append((coin, qty))
+        else:
+            comp["buys"].append((coin, qty))
+            comp["raw_ops"].append(f"FALLBACK_OTHER:{operation}")
 
     inserted = 0
+    usd_stables = {"USDT", "USDC", "BUSD", "USD"}
 
-    # --- Insertion des simples ---
-    usd_stables = {"USDT", "USDC", "BUSD", "USD"}  # tu peux remonter ça en haut si tu veux
-
+    # ---------- insertion des simples ----------
     for r in simple_rows:
         dt = r["datetime"]
         qty = r["quantity"]
@@ -1170,12 +944,9 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
         price_eur = r.get("price_eur", 0.0)
         fees_eur = r.get("fees_eur", 0.0)
 
-        # Si c'est de l'EUR qui rentre / sort → montant en EUR direct
         if pair == "EUR":
             price_eur = abs(qty)
 
-        # 💰 Fallback pour dépôts / retraits / income en crypto :
-        # on valorise à prix_jour(coin_USD) * fx * quantité
         if (
                 price_eur == 0
                 and pair not in {"EUR"} | usd_stables
@@ -1199,9 +970,7 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
         db.add(tx)
         inserted += 1
 
-    # --- Insertion des opérations composées ---
-    usd_stables = {"USDT", "USDC", "BUSD", "USD"}
-
+    # ---------- insertion des composés ----------
     for key, comp in composed_ops.items():
         dt = comp["datetime"]
         if not dt:
@@ -1214,25 +983,21 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
         fees = comp["fees"]
         raw_ops = comp["raw_ops"]
 
-        # ---- EUR direct ----
         total_spent_eur = sum(abs(qty) for coin, qty in spends if coin == "EUR")
-        total_fees_eur  = sum(abs(qty) for coin, qty in fees   if coin == "EUR")
+        total_fees_eur = sum(abs(qty) for coin, qty in fees if coin == "EUR")
 
-        # ---- USD / stablecoins -> EUR via fx table ----
         usd_spent = sum(abs(qty) for coin, qty in spends if coin in usd_stables)
-        usd_fees  = sum(abs(qty) for coin, qty in fees   if coin in usd_stables)
+        usd_fees = sum(abs(qty) for coin, qty in fees if coin in usd_stables)
 
         fx = get_usd_eur_rate(db, dt)
 
         total_spent_eur += usd_spent * fx
-        total_fees_eur  += usd_fees * fx
+        total_fees_eur += usd_fees * fx
 
-        # PATCH : montant reçu en EUR (jambe "buys")
         total_received_eur = sum(abs(qty) for coin, qty in buys if coin == "EUR")
         usd_received = sum(abs(qty) for coin, qty in buys if coin in usd_stables)
         total_received_eur += usd_received * fx
 
-        # -------- from / to assets (agrégés) --------
         from_asset, from_amount = None, 0.0
         to_asset, to_amount = None, 0.0
 
@@ -1250,14 +1015,12 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
                 if coin == to_asset:
                     to_amount += qty
 
-        # Cas particulier : "Buy Crypto With Fiat" (aucune ligne EUR dans le CSV)
         if (
                 total_spent_eur == 0
                 and from_asset is None
                 and to_asset is not None
                 and any("BUY CRYPTO WITH FIAT" in op.upper() for op in raw_ops)
         ):
-            # On reconstruit le prix total en EUR: quantité * prix_jour(BCH_USD) * fx
             price_usd = get_coin_price_usd(db, to_asset, dt)
             if price_usd is not None:
                 total_spent_eur = abs(to_amount) * price_usd * fx
@@ -1275,29 +1038,25 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
             )
         if fees_summary:
             note_parts.append(f"Fees: {fees_summary}")
-
         note = " | ".join(note_parts) if note_parts else None
 
-        # -------- Classification + affectation du price_eur --------
         side = "OTHER"
         pair = to_asset or from_asset or "UNKNOWN"
         quantity = to_amount if to_amount != 0 else from_amount
-        price_eur = 0.0  # on choisira ensuite
+        price_eur = 0.0
 
-        # BUY : on dépense du fiat/stable, on reçoit de la crypto
+        # BUY crypto contre cash
         if from_asset in {"EUR"} | usd_stables and to_asset and to_asset not in {"EUR"} | usd_stables:
             side = "BUY"
             pair = to_asset
             quantity = to_amount
-            # montant dépensé = jambe "spends"
             price_eur = total_spent_eur or total_received_eur
 
-        # SELL : on vend de la crypto contre du fiat/stable
+        # SELL crypto contre cash
         elif to_asset in {"EUR"} | usd_stables and from_asset and from_asset not in {"EUR"} | usd_stables:
             side = "SELL"
             pair = from_asset
             quantity = from_amount
-            # montant reçu = jambe "buys"
             price_eur = total_received_eur or total_spent_eur
 
         # CONVERT crypto-crypto
@@ -1305,16 +1064,12 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
             side = "CONVERT"
             pair = to_asset
             quantity = to_amount
-            # on laissera le fallback prix_jour plus bas
 
         elif to_asset and not from_asset:
             side = "BUY"
             pair = to_asset
             quantity = to_amount
 
-        # 🔥 Fallback : si on n’a toujours pas de prix EUR
-        # (BUY / SELL / CONVERT crypto-crypto)
-        # on prend prix_jour(coin en USD) * fx * quantité
         if (
                 price_eur == 0
                 and side in {"BUY", "SELL", "CONVERT"}
@@ -1340,27 +1095,17 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
     db.commit()
     return {"inserted": inserted}
 
-from xml.etree import ElementTree as ET
-from datetime import datetime, date
+# ===================== Import FX USD/EUR =====================
 
 @app.post("/import/fx-usdeur")
 async def import_fx_usdeur(
         file: UploadFile = File(...),
         db: Session = Depends(get_db),
 ):
-    """
-    Importe un fichier XML ECB contenant les taux USD/EUR journaliers.
-    On ne garde que la série CURRENCY=USD / CURRENCY_DENOM=EUR.
-    """
-
     content = await file.read()
-    # Parse XML
     tree = ET.fromstring(content)
 
-    # Namespace ECB (présent dans ton fichier)
     NS = {"exr": "http://www.ecb.europa.eu/vocabulary/stats/exr/1"}
-
-    # On va chercher les Series
     series_list = tree.findall(".//exr:Series", NS)
 
     if not series_list:
@@ -1373,17 +1118,14 @@ async def import_fx_usdeur(
         curr = attrs.get("CURRENCY")
         denom = attrs.get("CURRENCY_DENOM")
 
-        # On ne prend que USD/EUR
         if curr != "USD" or denom != "EUR":
             continue
 
-        # Pour éviter les doublons brutaux, on peut supprimer l'ancien jeu
         db.query(FXRate).filter(
             FXRate.base == "USD",
             FXRate.quote == "EUR",
             ).delete()
 
-        # Chaque Obs = 1 jour de taux
         for obs in series.findall("exr:Obs", NS):
             d_str = obs.attrib.get("TIME_PERIOD")
             v_str = obs.attrib.get("OBS_VALUE")
