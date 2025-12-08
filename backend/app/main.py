@@ -30,7 +30,28 @@ CCC_BASE_URL = "https://www.cryptocurrencychart.com/api"
 FIAT_SYMS = {"EUR", "USD"}          # monnaies ayant cours légal
 STABLE_SYMS = {"USDT", "USDC", "BUSD", "TUSD", "FDUSD"}
 
-# Ancien comportement "pas de prix CCC pour fiat / stables"
+TYPE_MAP = {
+    "ACHAT": "BUY",
+    "VENTE": "SELL",
+    "DEPOT": "DEPOSIT",
+    "DÉPÔT": "DEPOSIT",
+    "RETRAIT": "WITHDRAWAL",
+    "CONVERT": "CONVERT",
+
+    # Au cas où le front envoie déjà les clés internes :
+    "BUY": "BUY",
+    "SELL": "SELL",
+    "DEPOSIT": "DEPOSIT",
+    "WITHDRAWAL": "WITHDRAWAL",
+}
+
+# ============ Cache simple des événements fiscaux ============
+
+_tax_cache: dict[str, object] = {
+    "events": None,     # dict[int, dict]
+    "tx_count": 0,      # nombre de lignes TransactionDB
+}
+
 def is_fiat_or_stable(symbol: str) -> bool:
     s = (symbol or "").upper()
     return s in FIAT_SYMS or s in STABLE_SYMS
@@ -454,19 +475,27 @@ def is_taxable(tx: TransactionDB) -> bool:
 
     return False
 
-def compute_portfolio_value_eur(db: Session,
-                                holdings_qty: dict[str, float],
-                                dt: datetime) -> float:
+def compute_portfolio_value_eur(
+        db: Session,
+        holdings_qty: dict[str, float],
+        dt: datetime,
+        price_cache: dict[tuple[str, date], float],
+        fx_cache: dict[date, float],
+) -> float:
     """
-    Valeur globale du portefeuille (en EUR) à la date dt,
-    pour le calcul 150 VH bis.
-
-    On compte :
-      - toutes les cryptos ET stables (actifs numériques)
-      - on exclut les FIAT (EUR, USD...) qui ne sont pas des "actifs numériques".
+    Valeur globale du portefeuille (en EUR) à la date dt.
+    Utilise des caches `price_cache` et `fx_cache` pour éviter les requêtes SQL
+    répétées.
     """
     total = 0.0
-    day = dt
+    d = dt.date()
+
+    # cache FX
+    if d in fx_cache:
+        fx = fx_cache[d]
+    else:
+        fx = get_usd_eur_rate(db, dt)
+        fx_cache[d] = fx
 
     for sym, qty in holdings_qty.items():
         if abs(qty) < 1e-12:
@@ -474,24 +503,48 @@ def compute_portfolio_value_eur(db: Session,
 
         s = sym.upper()
 
-        # Les FIAT ne font pas partie du portefeuille d'actifs numériques
+        # FIAT hors portefeuille d'actifs numériques
         if is_fiat(s):
             continue
 
-        # Stables : prix 1 USD
+        # prix en USD
         if is_stable(s):
             price_usd = 1.0
         else:
-            price_usd = get_coin_price_usd(db, s, day)
-            if price_usd is None:
-                continue
+            key = (s, d)
+            if key in price_cache:
+                price_usd = price_cache[key]
+            else:
+                price_usd = get_coin_price_usd(db, s, dt)
+                price_cache[key] = price_usd
 
-        fx = get_usd_eur_rate(db, day)
+        if price_usd is None:
+            continue
+
         total += qty * price_usd * fx
 
     return total
 
+from sqlalchemy import func
+
 def compute_tax_events_all_years(db: Session) -> dict[int, dict]:
+    """
+    Wrapper avec cache en mémoire.
+    On ne recalcule la fiscalité que si le nombre de transactions a changé
+    (i.e. nouvel import / purge).
+    """
+    global _tax_cache
+
+    tx_count = db.query(func.count(TransactionDB.id)).scalar() or 0
+
+    if _tax_cache["events"] is None or _tax_cache["tx_count"] != tx_count:
+        events = _compute_tax_events_all_years_internal(db)
+        _tax_cache["events"] = events
+        _tax_cache["tx_count"] = tx_count
+
+    return _tax_cache["events"]  # dict {tx_id: {...}}
+
+def _compute_tax_events_all_years_internal(db: Session) -> dict[int, dict]:
     """
     Implémentation (approx) de l'article 150 VH bis :
 
@@ -509,7 +562,8 @@ def compute_tax_events_all_years(db: Session) -> dict[int, dict]:
       - on retire du pool une fraction du coût : A <- A - (A * C / V)
       - le portefeuille en coins est mis à jour (on enlève la quantité vendue).
     """
-
+    price_cache: dict[tuple[str, date], float] = {}
+    fx_cache: dict[date, float] = {}
     txs = (
         db.query(TransactionDB)
         .order_by(TransactionDB.datetime.asc())
@@ -613,8 +667,13 @@ def compute_tax_events_all_years(db: Session) -> dict[int, dict]:
             C = abs(trade_value_eur)
 
             # Valeur globale du portefeuille V juste AVANT la vente
-            V = compute_portfolio_value_eur(db, holdings_qty, tx.datetime)
-
+            V = compute_portfolio_value_eur(
+                db,
+                holdings_qty,
+                tx.datetime,
+                price_cache,
+                fx_cache,
+            )
             if V <= 0 or acquisition_cost_eur <= 0:
                 # pas de base de coût connue → on considère tout en PV brute
                 pv = C
@@ -730,7 +789,7 @@ def list_transactions(
     rows = normalized_rows
 
     if types:
-        allowed = {t.upper() for t in types}
+        allowed = {TYPE_MAP.get(t.upper(), t.upper()) for t in types}
         rows = [tx for tx in rows if normalize_side(tx) in allowed]
 
     start = offset
@@ -787,7 +846,7 @@ def get_summary(
     rows = query.all()
 
     if types:
-        allowed = {t.upper() for t in types}
+        allowed = {TYPE_MAP.get(t.upper(), t.upper()) for t in types}
         rows = [tx for tx in rows if normalize_side(tx) in allowed]
 
     total = len(rows)
