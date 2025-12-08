@@ -61,6 +61,28 @@ const TYPE_FILTERS = [
   { value: "OTHER", label: "Autre" },
 ];
 
+function isTransactionTaxable(tx) {
+  const side = (tx.side || "").toUpperCase();
+  const direction = tx.direction || "";
+
+  // Dépôts / retraits / earn / subscr. → jamais imposables directement
+  if (["DEPOSIT", "WITHDRAWAL", "INCOME", "SUBSCRIPTION"].includes(side)) {
+    return false;
+  }
+
+  // On parse "FROM -> TO"
+  const parts = direction.split("->").map((s) => s.trim());
+  const toAsset = parts[1] || null;
+
+  // Imposable uniquement quand on ressort en EUR
+  if (toAsset === "EUR") {
+    return true;
+  }
+
+  // Par défaut : non imposable
+  return false;
+}
+
 function App() {
   const [transactions, setTransactions] = useState([]);
   const [summary, setSummary] = useState({
@@ -208,10 +230,10 @@ function App() {
   // Transactions après filtre imposition (sur la page courante)
   const displayedTransactions = useMemo(() => {
     if (taxFilter === "yes") {
-      return transactions.filter((t) => t.taxable);
+      return transactions.filter((t) => isTransactionTaxable(t));
     }
     if (taxFilter === "no") {
-      return transactions.filter((t) => !t.taxable);
+      return transactions.filter((t) => !isTransactionTaxable(t));
     }
     return transactions;
   }, [transactions, taxFilter]);
@@ -669,6 +691,7 @@ function App() {
                   </tr>
                 ) : (
                   displayedTransactions.map((tx) => {
+                    const taxable = isTransactionTaxable(tx);
                     const sideUpper = (tx.side || "").toUpperCase();
                     const badgeClass =
                       TYPE_BADGE_COLORS[sideUpper] ||
@@ -688,7 +711,7 @@ function App() {
                           {formatDate(tx.datetime)}
                         </td>
                         <td className="px-3 py-2 text-center">
-                          {tx.taxable ? (
+                          {taxable ? (
                             <span className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-emerald-500/10 border border-emerald-500/50 text-emerald-400 text-[11px]">
                               ✔
                             </span>
