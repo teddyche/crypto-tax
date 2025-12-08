@@ -300,6 +300,17 @@ class TaxYearOut(BaseModel):
     flat_tax_30: float
     events: List[TaxEventOut]
 
+class PositionOut(BaseModel):
+    symbol: str
+    quantity: float
+    value_eur: float
+
+class DailyPortfolioOut(BaseModel):
+    date: date
+    total_value_eur: float
+    daily_pnl_eur: float
+    positions: List[PositionOut]
+
 # ---------- DB utils ----------
 
 def get_db():
@@ -309,6 +320,140 @@ def get_db():
     finally:
         db.close()
 
+import re
+from collections import defaultdict
+
+def compute_daily_portfolio(db: Session, year: int | None = None) -> list[DailyPortfolioOut]:
+    """
+    Reconstruit le portefeuille jour par jour à partir des transactions.
+
+    Hypothèses :
+      - On travaille en scope "Binance only" (ce que voit la DB).
+      - BUY / DEPOSIT / INCOME augmentent la quantité de l'asset.
+      - SELL / WITHDRAWAL la réduisent.
+      - CONVERT : on parse le note "From X BTC -> Y BCH" pour décrémenter X et
+        incrémenter Y (sinon on ignore le from, fallback ≈ BUY).
+    """
+
+    # 1. On récupère toutes les transactions dans l’ordre chronologique
+    query = db.query(TransactionDB)
+    if year is not None:
+        query = query.filter(func.extract("year", TransactionDB.datetime) == year)
+
+    txs: list[TransactionDB] = query.order_by(TransactionDB.datetime.asc()).all()
+    if not txs:
+        return []
+
+    # 2. On prépare
+    holdings: dict[str, float] = defaultdict(float)  # quantité par coin
+    by_day: dict[date, list[TransactionDB]] = defaultdict(list)
+
+    for tx in txs:
+        d = tx.datetime.date()
+        by_day[d].append(tx)
+
+    all_days = sorted(by_day.keys())
+    results: list[DailyPortfolioOut] = []
+
+    prev_total_value = 0.0
+
+    for d in all_days:
+        day_txs = by_day[d]
+        net_flow_eur = 0.0  # flux "externe" du jour (EUR qui rentre/sort)
+
+        # 3. On applique les transactions du jour sur les holdings
+        for tx in day_txs:
+            side = normalize_side(tx)
+            pair = (tx.pair or "").upper()
+            qty = tx.quantity or 0.0
+
+            # a) flux externes en EUR pour le PnL
+            if pair == "EUR" and side in {"DEPOSIT", "WITHDRAWAL"}:
+                if side == "DEPOSIT":
+                    net_flow_eur += abs(tx.price_eur or 0.0)
+                else:
+                    net_flow_eur -= abs(tx.price_eur or 0.0)
+
+            # b) mise à jour des quantités crypto
+            if pair == "EUR" or is_fiat_or_stable(pair):
+                # on ne stocke pas EUR/USDT/... dans les holdings de l’onglet portfolio
+                continue
+
+            if side in {"BUY", "DEPOSIT", "INCOME"}:
+                holdings[pair] += abs(qty)
+
+            elif side in {"SELL", "WITHDRAWAL"}:
+                holdings[pair] -= abs(qty)
+
+            elif side == "CONVERT":
+                # On essaye de parser le FROM/TO depuis le note
+                note = tx.note or ""
+                m = re.search(
+                    r"From\s+([\-0-9\.]+)\s+([A-Z0-9]+)\s*->\s*([\-0-9\.]+)\s+([A-Z0-9]+)",
+                    note,
+                )
+                if m:
+                    from_amount = float(m.group(1))
+                    from_sym = m.group(2).upper()
+                    to_amount = float(m.group(3))
+                    to_sym = m.group(4).upper()
+
+                    if not is_fiat_or_stable(from_sym) and from_sym != "EUR":
+                        holdings[from_sym] -= abs(from_amount)
+                    if not is_fiat_or_stable(to_sym) and to_sym != "EUR":
+                        holdings[to_sym] += abs(to_amount)
+                else:
+                    # fallback : on considère juste que c’est un BUY du pair
+                    holdings[pair] += abs(qty)
+
+        # 4. Valorisation du portefeuille ce jour-là
+        day_total_value = 0.0
+        positions_out: list[PositionOut] = []
+
+        day_dt = datetime.combine(d, datetime.min.time())
+
+        for sym, q in list(holdings.items()):
+            # on nettoie les positions quasi-nulles
+            if abs(q) < 1e-12:
+                holdings.pop(sym, None)
+                continue
+
+            if is_fiat_or_stable(sym) or sym == "EUR":
+                # l’onglet portfolio = seulement les coins "vrais"
+                continue
+
+            price_usd = get_coin_price_usd(db, sym, day_dt)
+            if price_usd is None:
+                continue
+
+            fx = get_usd_eur_rate(db, day_dt)
+            value_eur = q * price_usd * fx
+            day_total_value += value_eur
+
+            positions_out.append(
+                PositionOut(
+                    symbol=sym,
+                    quantity=q,
+                    value_eur=value_eur,
+                )
+            )
+
+        positions_out.sort(key=lambda p: -abs(p.value_eur))
+
+        # 5. PnL du jour (approx) : variation de valeur - flux net EUR
+        daily_pnl = day_total_value - (prev_total_value + net_flow_eur)
+        prev_total_value = day_total_value
+
+        results.append(
+            DailyPortfolioOut(
+                date=d,
+                total_value_eur=day_total_value,
+                daily_pnl_eur=daily_pnl,
+                positions=positions_out,
+            )
+        )
+
+    return results
 
 # ---------- Helpers de normalisation Binance ----------
 def normalize_side(tx: TransactionDB) -> str:
@@ -523,6 +668,20 @@ def get_summary(
         total_withdrawal=total_withdrawal,
         total_convert=total_convert,
     )
+
+@app.get("/portfolio/daily", response_model=List[DailyPortfolioOut])
+def get_daily_portfolio(
+        year: int | None = Query(None),
+        db: Session = Depends(get_db),
+):
+    """
+    Time-series du portefeuille (Binance seulement), valorisé en EUR par jour.
+    Utilisable pour :
+      - graphe de valeur totale jour par jour
+      - breakdown par asset à la date sélectionnée
+      - PnL journalier approximatif
+    """
+    return compute_daily_portfolio(db, year=year)
 
 @app.get("/tax/{year}")
 def compute_tax(year: int, db: Session = Depends(get_db)):
