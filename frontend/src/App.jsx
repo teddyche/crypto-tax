@@ -14,6 +14,16 @@ function formatDate(dateStr) {
   });
 }
 
+function formatMoney(value) {
+  if (value === null || value === undefined) return "—";
+  return (
+    value.toLocaleString("fr-FR", {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    }) + " €"
+  );
+}
+
 function classNames(...classes) {
   return classes.filter(Boolean).join(" ");
 }
@@ -626,27 +636,24 @@ function App() {
 
           <div className="overflow-x-auto">
             <table className="min-w-full text-xs">
-              <thead className="bg-slate-900/80 border-b border-slate-800">
-                <tr className="text-[11px] uppercase tracking-wide text-slate-500">
-                  <th className="px-4 py-2 text-left font-medium">Date</th>
-                  <th className="px-3 py-2 text-center font-medium">
-                    Imposable
-                  </th>
-                  <th className="px-3 py-2 text-left font-medium">Type</th>
-                  <th className="px-3 py-2 text-left font-medium">
-                    Pair / Coin
-                  </th>
-                  <th className="px-3 py-2 text-left font-medium">
-                    Vers / Depuis
-                  </th>
-                  <th className="px-3 py-2 text-right font-medium">Quantité</th>
-                  <th className="px-3 py-2 text-right font-medium">Prix EUR</th>
-                  <th className="px-3 py-2 text-right font-medium">
-                    Frais EUR
-                  </th>
-                  <th className="px-4 py-2 text-left font-medium">Note</th>
-                </tr>
-              </thead>
+                <thead className="bg-slate-900/80 border-b border-slate-800">
+                  <tr className="text-[11px] uppercase tracking-wide text-slate-500">
+                    <th className="px-4 py-2 text-left font-medium">Date</th>
+                    <th className="px-3 py-2 text-center font-medium">Imposable</th>
+                    <th className="px-3 py-2 text-left font-medium">Type</th>
+                    <th className="px-3 py-2 text-left font-medium">Pair / Coin</th>
+                    <th className="px-3 py-2 text-left font-medium">Vers / Depuis</th>
+                    <th className="px-3 py-2 text-right font-medium">Quantité</th>
+                    <th className="px-3 py-2 text-right font-medium">Prix EUR</th>
+                    <th className="px-3 py-2 text-right font-medium">Frais EUR</th>
+                    <th className="px-3 py-2 text-right font-medium">PV (ligne)</th>
+                    <th className="px-3 py-2 text-right font-medium">
+                      PV cumulée (année)
+                    </th>
+                    <th className="px-3 py-2 text-right font-medium">Taxe estimée</th>
+                    <th className="px-4 py-2 text-left font-medium">Note</th>
+                  </tr>
+                </thead>
               <tbody>
                 {loading ? (
                   <tr>
@@ -679,87 +686,112 @@ function App() {
                     else if (qtyNumber < 0) qtyColor = "text-red-400";
 
                     return (
-                      <tr
-                        key={tx.id}
-                        className="border-b border-slate-900/60 hover:bg-slate-900/60 transition-colors"
-                      >
-                        <td className="px-4 py-2 text-slate-300 whitespace-nowrap">
-                          {formatDate(tx.datetime)}
-                        </td>
-
-                        {/* Imposable */}
-                        <td className="px-3 py-2 text-center">
-                          <span
-                            className={classNames(
-                              "inline-flex h-5 w-5 items-center justify-center rounded-full border text-[10px]",
-                              tx.taxable
-                                ? "bg-emerald-500/10 border-emerald-400 text-emerald-300"
-                                : "bg-slate-900 border-slate-600 text-slate-500"
-                            )}
-                          >
-                            {tx.taxable ? "✔" : "✕"}
-                          </span>
-                        </td>
-
-                        {/* Type */}
-                        <td className="px-3 py-2">
-                          <span
-                            className={classNames(
-                              "inline-flex items-center px-2.5 py-0.5 rounded-full text-[11px] font-medium",
-                              badgeClass
-                            )}
-                          >
-                            {formatSideLabel(sideUpper)}
-                          </span>
-                        </td>
-
-                        {/* Pair / Coin */}
-                        <td className="px-3 py-2 text-slate-200">
-                          {tx.pair || "—"}
-                        </td>
-
-                        {/* Vers / Depuis */}
-                        <td className="px-3 py-2 text-slate-400">
-                          {tx.direction || "—"}
-                        </td>
-
-                        {/* Quantité */}
-                        <td
-                          className={classNames(
-                            "px-3 py-2 text-right tabular-nums",
-                            qtyColor
-                          )}
+                        <tr
+                          key={tx.id}
+                          className="border-b border-slate-900/60 hover:bg-slate-900/60 transition-colors"
                         >
-                          {tx.quantity?.toLocaleString("fr-FR", {
-                            maximumFractionDigits: 8,
-                          }) || "0"}
-                        </td>
+                          {/* Date */}
+                          <td className="px-4 py-2 text-slate-300 whitespace-nowrap">
+                            {formatDate(tx.datetime)}
+                          </td>
 
-                        {/* Prix EUR */}
-                        <td className="px-3 py-2 text-right text-slate-400 tabular-nums">
-                          {tx.price_eur
-                            ? tx.price_eur.toLocaleString("fr-FR", {
-                                minimumFractionDigits: 2,
-                                maximumFractionDigits: 2,
-                              }) + " €"
-                            : "0,00 €"}
-                        </td>
+                          {/* Imposable (✓ / ✕) */}
+                          <td className="px-3 py-2 text-center">
+                            {tx.taxable ? (
+                              <span className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 text-xs">
+                                ✓
+                              </span>
+                            ) : (
+                              <span className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-slate-800/60 border border-slate-600/50 text-slate-500 text-xs">
+                                ✕
+                              </span>
+                            )}
+                          </td>
 
-                        {/* Frais EUR */}
-                        <td className="px-3 py-2 text-right text-slate-400 tabular-nums">
-                          {tx.fees_eur
-                            ? tx.fees_eur.toLocaleString("fr-FR", {
-                                minimumFractionDigits: 2,
-                                maximumFractionDigits: 2,
-                              }) + " €"
-                            : "0,00 €"}
-                        </td>
+                          {/* Type */}
+                          <td className="px-3 py-2">
+                            <span
+                              className={classNames(
+                                "inline-flex items-center px-2.5 py-0.5 rounded-full text-[11px] font-medium",
+                                TYPE_BADGE_COLORS[(tx.side || "").toUpperCase()] ||
+                                  TYPE_BADGE_COLORS.OTHER
+                              )}
+                            >
+                              {formatSideLabel((tx.side || "").toUpperCase())}
+                            </span>
+                          </td>
 
-                        {/* Note */}
-                        <td className="px-4 py-2 text-slate-400 max-w-xs truncate">
-                          {tx.note || "—"}
-                        </td>
-                      </tr>
+                          {/* Pair / coin */}
+                          <td className="px-3 py-2 text-slate-200">
+                            {tx.pair || "—"}
+                          </td>
+
+                          {/* Vers / Depuis */}
+                          <td className="px-3 py-2 text-slate-400 whitespace-nowrap">
+                            {tx.direction || "—"}
+                          </td>
+
+                          {/* Quantité */}
+                          <td
+                            className={classNames(
+                              "px-3 py-2 text-right tabular-nums",
+                              (tx.quantity || 0) > 0
+                                ? "text-emerald-400"
+                                : (tx.quantity || 0) < 0
+                                ? "text-red-400"
+                                : "text-slate-200"
+                            )}
+                          >
+                            {tx.quantity?.toLocaleString("fr-FR", {
+                              maximumFractionDigits: 8,
+                            }) || "0"}
+                          </td>
+
+                          {/* Prix EUR */}
+                          <td className="px-3 py-2 text-right text-slate-400 tabular-nums">
+                            {formatMoney(tx.price_eur)}
+                          </td>
+
+                          {/* Frais EUR */}
+                          <td className="px-3 py-2 text-right text-slate-400 tabular-nums">
+                            {formatMoney(tx.fees_eur)}
+                          </td>
+
+                          {/* PV ligne */}
+                          <td
+                            className={classNames(
+                              "px-3 py-2 text-right tabular-nums",
+                              tx.pv_eur == null
+                                ? "text-slate-500"
+                                : tx.pv_eur > 0
+                                ? "text-emerald-400"
+                                : tx.pv_eur < 0
+                                ? "text-red-400"
+                                : "text-slate-200"
+                            )}
+                          >
+                            {tx.pv_eur == null ? "—" : formatMoney(tx.pv_eur)}
+                          </td>
+
+                          {/* PV cumulée année */}
+                          <td className="px-3 py-2 text-right tabular-nums text-slate-200">
+                            {tx.cum_pv_year_eur == null
+                              ? "—"
+                              : formatMoney(tx.cum_pv_year_eur)}
+                          </td>
+
+                          {/* Taxe estimée */}
+                          <td className="px-3 py-2 text-right tabular-nums text-amber-300">
+                            {tx.estimated_tax_eur == null
+                              ? "—"
+                              : formatMoney(tx.estimated_tax_eur)}
+                          </td>
+
+                          {/* Note */}
+                          <td className="px-4 py-2 text-slate-400 max-w-xs truncate">
+                            {tx.note || "—"}
+                          </td>
+                        </tr>
                     );
                   })
                 )}

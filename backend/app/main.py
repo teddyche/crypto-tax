@@ -25,9 +25,11 @@ CCC_API_KEY = "912f4971567ad6da574774b52bdd0a5f"
 CCC_API_SECRET = "7cb5e29e15306be715942b8675383e74"
 CCC_BASE_URL = "https://www.cryptocurrencychart.com/api"
 
+TAXABLE_OUT_SYMS = {"EUR", "USDT", "USDC"}
 FIAT_SYMS = {"EUR", "USD"}
 STABLE_SYMS = {"USDT", "USDC", "BUSD", "TUSD", "FDUSD"}
-TAXABLE_OUT_SYMS = {"EUR", "USDT", "USDC"}
+
+TAX_BASE = FIAT_SYMS | STABLE_SYMS  # ce qui compte comme "cash" pour l'imposition
 
 def is_fiat_or_stable(symbol: str) -> bool:
     s = (symbol or "").upper()
@@ -266,9 +268,14 @@ class TransactionOut(BaseModel):
     fees_eur: float | None = None
     note: str | None = None
 
-    # 🆕
+    # Imposition & direction
     taxable: bool
     direction: str | None = None
+
+    # 🆕 Champs fiscaux détaillés (peuvent être None si non imposable)
+    pv_eur: float | None = None              # PV de la ligne
+    cum_pv_year_eur: float | None = None     # PV cumulée de l'année
+    estimated_tax_eur: float | None = None   # = max(cum_pv_year, 0) * 0.30
 
     class Config:
         from_attributes = True
@@ -534,12 +541,14 @@ def extract_from_to(tx: TransactionDB) -> tuple[str | None, str | None]:
 
 def is_taxable(tx: TransactionDB) -> bool:
     """
-    Approximation FR : on considère imposable uniquement quand on sort
-    d'un coin vers EUR / stable (USDT, USDC…).
+    Imposable = on sort de la crypto vers une "monnaie" considérée comme cash :
+    - EUR
+    - stablecoins en USD (USDT, USDC, BUSD, TUSD, FDUSD)
 
-    - SELL : on suppose que c'est une vente de crypto -> EUR / stable
-    - CONVERT : imposable uniquement si la jambe de destination est EUR / stable
-      (cas très rare normalement, la plupart sont classées BUY/SELL).
+    Règle :
+    - on ne regarde QUE les opérations normalisées en SELL ou CONVERT
+    - on considère imposable quand on *termine* dans TAX_BASE (EUR / stable)
+      via le couple "From X COIN -> Y CASH" dans la note.
     """
     s = normalize_side(tx)
     if s not in {"SELL", "CONVERT"}:
@@ -547,25 +556,114 @@ def is_taxable(tx: TransactionDB) -> bool:
 
     from_asset, to_asset = extract_from_to(tx)
 
-    # Si on a bien un "From X -> Y"
-    if to_asset:
-        to_sym = to_asset.upper()
+    # Cas principal : on a bien un "From ... -> ..."
+    if from_asset or to_asset:
+        # Imposable si on termine dans du cash (EUR, USDT, USDC, ...)
+        return (to_asset or "").upper() in TAX_BASE
 
-        # Taxable seulement si on FINIT en EUR / stable
-        if to_sym in TAXABLE_OUT_SYMS:
-            return True
-
-        # Exemple à ne PAS taxer : EUR -> BCH (to_sym = BCH)
-        return False
-
-    # Pas de direction exploitable dans la note :
-    # pour nos SELL reconstruits, on sait que c'est crypto -> EUR / stable
-    if s == "SELL":
+    # Fallback ultra simple : pas de note, mais pair = cash (rare)
+    pair = (tx.pair or "").upper()
+    if s == "SELL" and pair in TAX_BASE:
         return True
 
-    # CONVERT sans direction claire : on ne le taxe pas
     return False
 
+from collections import defaultdict
+
+def compute_tax_events_all_years(db: Session) -> dict[int, dict]:
+    """
+    Calcule les événements fiscaux (SELL vers EUR / stables) sur tout l'historique,
+    en méthode "prix moyen" par actif.
+
+    Retourne un dict:
+        { tx_id: {
+            "id": ...,
+            "datetime": ...,
+            "pair": <asset vendu>,
+            "side": "SELL",
+            "proceeds_eur": ...,
+            "pv_eur": ...,                  # PV de la ligne
+            "cum_pv_year_eur": ...,         # PV cumulée de l'année après cette ligne
+            "estimated_tax_eur": ...        # max(cum_pv_year, 0) * 0.30
+        }}
+    """
+
+    txs = (
+        db.query(TransactionDB)
+        .order_by(TransactionDB.datetime.asc())
+        .all()
+    )
+
+    holdings_qty: dict[str, float] = defaultdict(float)
+    holdings_cost: dict[str, float] = defaultdict(float)
+    cum_pv_by_year: dict[int, float] = defaultdict(float)
+
+    events_by_id: dict[int, dict] = {}
+
+    for tx in txs:
+        side = normalize_side(tx)
+        asset = (tx.pair or "").upper()
+        if not asset:
+            continue
+
+        qty = tx.quantity or 0.0
+        trade_value = tx.price_eur or 0.0  # valeur totale en EUR (pas prix unitaire)
+        year = tx.datetime.year
+
+        # ----- acquisitions dans le pool (on ne track que les vraies cryptos) -----
+        if side in {"BUY", "DEPOSIT", "INCOME"} and asset not in TAX_BASE:
+            if qty < 0:
+                qty = -qty
+            holdings_qty[asset] += qty
+            holdings_cost[asset] += abs(trade_value)
+            continue
+
+        # ----- évènements imposables : SELL vers EUR / stables -----
+        if side == "SELL" and is_taxable(tx) and asset not in TAX_BASE:
+            if qty > 0:
+                qty = -qty
+            qty_sold = abs(qty)
+
+            prev_qty = holdings_qty[asset]
+            prev_cost = holdings_cost[asset]
+
+            if prev_qty > 0:
+                unit_cost = prev_cost / prev_qty
+            else:
+                unit_cost = 0.0  # pas d'historique → on considère coût nul
+
+            cost_out = unit_cost * qty_sold
+            proceeds = abs(trade_value)
+            pv = proceeds - cost_out
+
+            # mise à jour de la position
+            new_qty = max(prev_qty - qty_sold, 0.0)
+            new_cost = max(prev_cost - cost_out, 0.0)
+            holdings_qty[asset] = new_qty
+            holdings_cost[asset] = new_cost
+
+            # cumul annuel
+            cum_pv_by_year[year] += pv
+            cum_pv_year = cum_pv_by_year[year]
+            est_tax = max(cum_pv_year, 0.0) * 0.30
+
+            events_by_id[tx.id] = {
+                "id": tx.id,
+                "datetime": tx.datetime,
+                "pair": asset,
+                "side": side,
+                "proceeds_eur": proceeds,
+                "pv_eur": pv,
+                "cum_pv_year_eur": cum_pv_year,
+                "estimated_tax_eur": est_tax,
+            }
+
+            continue
+
+        # tout le reste (WITHDRAWAL, CONVERT crypto/crypto, OTHER, ...) ne change pas la fiscalité
+        continue
+
+    return events_by_id
 
 def get_direction_label(tx: TransactionDB) -> str | None:
     """
@@ -671,10 +769,15 @@ def list_transactions(
     end = offset + limit
     page_rows = rows[start:end]
 
+    # 🆕 map des évènements fiscaux (PV / taxe) par id
+    tax_events = compute_tax_events_all_years(db)
+
     # 4. Sérialisation
     out: list[TransactionOut] = []
     for tx in page_rows:
         normalized = normalize_side(tx)
+        tax_info = tax_events.get(tx.id)
+
         out.append(
             TransactionOut(
                 id=tx.id,
@@ -688,10 +791,12 @@ def list_transactions(
                 note=tx.note,
                 taxable=is_taxable(tx),
                 direction=get_direction_label(tx),
+                pv_eur=tax_info["pv_eur"] if tax_info else None,
+                cum_pv_year_eur=tax_info["cum_pv_year_eur"] if tax_info else None,
+                estimated_tax_eur=tax_info["estimated_tax_eur"] if tax_info else None,
             )
         )
     return out
-
 
 @app.get("/summary", response_model=SummaryOut)
 def get_summary(
@@ -760,113 +865,39 @@ def get_daily_portfolio(
 @app.get("/tax/{year}")
 def compute_tax(year: int, db: Session = Depends(get_db)):
     """
-    Calcul simplifié des plus-values :
-      - moyenne d'achat par actif (average cost per coin)
-      - évènements taxables = SELL (y compris vers USDT/USDC/BUSD/EUR)
-      - WITHDRAWAL = transfert (ignoré)
-      - SUBSCRIPTION / EARN_RETURN / CONVERT = ignorés pour la fiscalité
-
-    ATTENTION : ce n'est PAS la méthode exacte française (valeur globale du portefeuille),
-    mais un modèle cohérent et vérifiable coin par coin.
+    Utilise le même calcul que pour les évènements ligne par ligne,
+    mais agrégé sur l'année demandée.
     """
+    events_by_id = compute_tax_events_all_years(db)
 
-    # On prend toutes les transactions jusqu'à fin de l'année pour avoir l'historique complet
-    end_dt = datetime(year, 12, 31, 23, 59, 59)
+    year_events = [
+        e for e in events_by_id.values()
+        if e["datetime"].year == year
+    ]
 
-    txs = (
-        db.query(TransactionDB)
-        .filter(TransactionDB.datetime <= end_dt)
-        .order_by(TransactionDB.datetime.asc())
-        .all()
-    )
+    total_pv_eur = sum(e["pv_eur"] for e in year_events)
+    flat_tax_30 = max(total_pv_eur, 0.0) * 0.30
 
-    # Position et coût moyen par actif
-    holdings_qty: dict[str, float] = defaultdict(float)
-    holdings_cost: dict[str, float] = defaultdict(float)
-
-    events: list[dict] = []
-    total_pv_eur = 0.0
-
-    for tx in txs:
-        side = normalize_side(tx)      # BUY / SELL / DEPOSIT / WITHDRAWAL / CONVERT / OTHER / HIDDEN / TRANSFER
-        asset = (tx.pair or "").upper()
-        if not asset:
-            continue
-
-        # On ignore explicitement ce qu'on a marqué comme caché / transfert interne
-        if side in {"HIDDEN", "TRANSFER"}:
-            continue
-
-        qty = tx.quantity or 0.0
-        if qty == 0:
-            continue
-
-        trade_value = tx.price_eur or 0.0  # valeur totale en EUR (pas prix unitaire)
-
-        # ----- ACQUISITIONS (on augmente le pool) -----
-        if side in {"BUY", "DEPOSIT", "INCOME"}:
-            # qty positive (on reçoit)
-            if qty < 0:
-                qty = -qty
-            holdings_qty[asset] += qty
-            holdings_cost[asset] += abs(trade_value)
-            continue
-
-        # ----- VENTES (évènements taxables) -----
-        if side == "SELL":
-            # on vend → qty doit être négative dans le CSV, on convertit
-            if qty > 0:
-                qty = -qty
-            qty_sold = abs(qty)
-
-            prev_qty = holdings_qty[asset]
-            prev_cost = holdings_cost[asset]
-
-            if prev_qty > 0:
-                unit_cost = prev_cost / prev_qty
-            else:
-                # aucun historique → on considère coût nul (toute la vente est PV)
-                unit_cost = 0.0
-
-            cost_out = unit_cost * qty_sold
-            proceeds = abs(trade_value)    # montant de la vente en EUR
-            pv = proceeds - cost_out       # plus-value (peut être négative)
-
-            # On met à jour la position résiduelle
-            new_qty = max(prev_qty - qty_sold, 0.0)
-            new_cost = max(prev_cost - cost_out, 0.0)
-
-            holdings_qty[asset] = new_qty
-            holdings_cost[asset] = new_cost
-
-            # On ne comptabilise la PV que si la vente est dans l'année demandée
-            if tx.datetime.year == year:
-                total_pv_eur += pv
-                events.append(
-                    {
-                        "id": tx.id,
-                        "datetime": tx.datetime,
-                        "pair": asset,
-                        "side": side,
-                        "proceeds_eur": proceeds,
-                        "pv_eur": pv,
-                    }
-                )
-
-            continue
-
-        # ----- Le reste : WITHDRAWAL, CONVERT, OTHER, etc. -----
-        # -> ignorés pour la fiscalité dans cette version
-        continue
-
-    flat_tax_30 = total_pv_eur * 0.30 if total_pv_eur > 0 else 0.0
+    # On renvoie les events au format historique que tu utilises déjà
+    events_out = [
+        {
+            "id": e["id"],
+            "datetime": e["datetime"],
+            "pair": e["pair"],
+            "side": e["side"],
+            "proceeds_eur": e["proceeds_eur"],
+            "pv_eur": e["pv_eur"],
+        }
+        for e in year_events
+    ]
 
     return {
         "year": year,
         "total_pv_eur": total_pv_eur,
         "flat_tax_30": flat_tax_30,
-        "events": events,
+        "events": events_out,
     }
+
 # ---------- Création manuelle ----------
 
 @app.post("/transactions", response_model=TransactionOut)
