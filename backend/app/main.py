@@ -867,6 +867,13 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
             pair = to_asset
             quantity = to_amount
 
+        # 🔥 Fallback : si on n’a toujours pas de prix EUR pour un BUY/SELL
+        # on prend prix_jour(coin en USD) * fx * quantité
+        if price_eur == 0 and side in {"BUY", "SELL"} and pair not in {"EUR"} | usd_stables:
+            price_usd = get_coin_price_usd(db, pair, dt)
+            if price_usd is not None:
+                price_eur = abs(quantity) * price_usd * fx
+
         tx = TransactionDB(
             datetime=dt,
             exchange="Binance",
