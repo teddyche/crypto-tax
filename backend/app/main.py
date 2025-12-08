@@ -1,6 +1,6 @@
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from typing import List, Optional, Literal
-
+import requests
 import csv
 from io import StringIO
 
@@ -11,7 +11,21 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from .db import Base, engine, SessionLocal
-from .models import TransactionDB, FXRate
+from .models import TransactionDB, FXRate, CoinMeta, CoinPrice
+
+# ---------- CryptoCurrencyChart API (historique de prix) ----------
+
+CCC_API_KEY = "912f4971567ad6da574774b52bdd0a5f"
+CCC_API_SECRET = "7cb5e29e15306be715942b8675383e74"
+CCC_BASE_URL = "https://www.cryptocurrencychart.com/api"
+
+FIAT_SYMS = {"EUR", "USD"}
+STABLE_SYMS = {"USDT", "USDC", "BUSD", "TUSD", "FDUSD"}
+
+
+def is_fiat_or_stable(symbol: str) -> bool:
+    s = (symbol or "").upper()
+    return s in FIAT_SYMS or s in STABLE_SYMS
 
 def get_usd_eur_rate(db: Session, dt: datetime) -> float:
     """
@@ -36,6 +50,157 @@ def get_usd_eur_rate(db: Session, dt: datetime) -> float:
         return 1.0
 
     return rate_obj.rate
+
+from sqlalchemy import func
+
+def ccc_get(path: str):
+    """
+    Appel générique à l'API CCC avec auth basic (clé + secret).
+    """
+    url = f"{CCC_BASE_URL}{path}"
+    r = requests.get(url, auth=(CCC_API_KEY, CCC_API_SECRET), timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+
+def get_or_create_coin_meta(db: Session, symbol: str) -> CoinMeta | None:
+    """
+    Récupère (ou crée) le mapping symbol -> id CCC.
+    Retourne None si le symbole n'existe pas chez CCC
+    (ou si c'est un fiat/stable type USDT, EUR).
+    """
+    symbol = (symbol or "").upper()
+
+    # Fiat / stables : on ne va pas chez CCC, on gère à part
+    if is_fiat_or_stable(symbol):
+        return None
+
+    meta = db.query(CoinMeta).filter_by(symbol=symbol).first()
+    if meta:
+        return meta
+
+    # Appel /coin/list une fois, on cherche par symbol
+    data = ccc_get("/coin/list")
+    coins = data.get("coins", [])
+
+    match = None
+    for c in coins:
+        if c.get("symbol", "").upper() == symbol:
+            match = c
+            break
+
+    if not match:
+        # Pas connu chez CCC
+        return None
+
+    meta = CoinMeta(
+        api_id=int(match["id"]),
+        symbol=symbol,
+        name=match.get("name"),
+        base_currency=(match.get("baseCurrency") or "USD").upper(),
+    )
+    db.add(meta)
+    db.commit()
+    db.refresh(meta)
+    return meta
+
+
+def fetch_history_chunk(coin_id: int, start: date, end: date, base_currency: str = "USD"):
+    """
+    Récupère l'historique journaliers pour [start, end] (max 2 ans).
+    """
+    path = f"/coin/history/{coin_id}/{start}/{end}/price/{base_currency}"
+    return ccc_get(path)
+
+
+def ensure_coin_history(
+        db: Session,
+        symbol: str,
+        start_date: date,
+        end_date: date,
+        base_currency: str = "USD",
+):
+    """
+    S'assure qu'on a les prix journaliers pour `symbol` sur [start_date, end_date].
+    Ne télécharge que ce qui manque.
+    """
+    symbol = (symbol or "").upper()
+
+    # Fiat / stables : rien à faire
+    if is_fiat_or_stable(symbol):
+        return
+
+    meta = get_or_create_coin_meta(db, symbol)
+    if not meta:
+        # Coin pas dispo chez CCC
+        return
+
+    base_currency = meta.base_currency or base_currency
+
+    # Ce qu'on a déjà
+    existing_min, existing_max = db.query(
+        func.min(CoinPrice.date),
+        func.max(CoinPrice.date),
+    ).filter(
+        CoinPrice.symbol == symbol,
+        CoinPrice.base == base_currency,
+        ).one()
+
+    cur = start_date
+    if existing_max is not None:
+        # On ne redemande que ce qui est après ce qu'on a déjà
+        cur = max(cur, existing_max + timedelta(days=1))
+
+    if cur > end_date:
+        return
+
+    while cur <= end_date:
+        chunk_end = min(
+            cur.replace(year=cur.year + 2) - timedelta(days=1),
+            end_date,
+            )
+
+        payload = fetch_history_chunk(meta.api_id, cur, chunk_end, base_currency)
+        for d in payload.get("data", []):
+            day = date.fromisoformat(d["date"])
+            price = float(d["price"])
+            cp = CoinPrice(
+                date=day,
+                symbol=symbol,
+                base=base_currency,
+                price=price,
+            )
+            # merge = insert or update
+            db.merge(cp)
+
+        db.commit()
+        cur = chunk_end + timedelta(days=1)
+
+
+def get_coin_price_usd(db: Session, symbol: str, dt: datetime) -> float | None:
+    """
+    Retourne le prix 1 coin -> USD pour ce jour (ou le plus récent avant).
+    """
+    symbol = (symbol or "").upper()
+
+    if symbol in {"USD", "USDT", "USDC", "BUSD", "TUSD", "FDUSD"}:
+        return 1.0
+    if symbol == "EUR":
+        # prix “en USD” pour l'EUR : 1 / fx (si on voulait)
+        return None
+
+    d = dt.date()
+    row = (
+        db.query(CoinPrice)
+        .filter(
+            CoinPrice.symbol == symbol,
+            CoinPrice.base == "USD",
+            CoinPrice.date <= d,
+            )
+        .order_by(CoinPrice.date.desc())
+        .first()
+    )
+    return row.price if row else None
 
 def map_operation_to_side(operation: str, quantity: float) -> str:
     op = (operation or "").upper()
@@ -376,6 +541,11 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
       - Deposit / Withdraw
       - Transaction Spend / Buy / Fee (Convert, achat, etc.)
       - Earn / Staking / Rewards -> INCOME
+
+    Avant de parser, on scanne le fichier pour :
+      - récupérer la liste des coins utilisés
+      - la plage de dates min/max
+      - pré-remplir l'historique de prix CCC pour chaque coin
     """
 
     content = await file.read()
@@ -384,9 +554,48 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
     # Détection séparateur , ou ;
     sample = s[:2048]
     dialect = csv.Sniffer().sniff(sample, delimiters=",;")
-    reader = csv.DictReader(StringIO(s), dialect=dialect)
 
-    # On va stocker les opérations composées par group_key
+    # On bufferise toutes les rows pour pouvoir faire 2 passes
+    rows = list(csv.DictReader(StringIO(s), dialect=dialect))
+
+    # --- Scan des assets + min/max dates ---
+    assets: set[str] = set()
+    min_date: date | None = None
+    max_date: date | None = None
+
+    for row in rows:
+        utc_time = (row.get("UTC_Time")
+                    or row.get("Date(UTC)")
+                    or row.get("Time")
+                    or "").strip()
+        if not utc_time:
+            continue
+
+        try:
+            dt = datetime.strptime(utc_time, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            try:
+                dt = datetime.fromisoformat(utc_time.replace("Z", "+00:00"))
+            except Exception:
+                continue
+
+        d = dt.date()
+        if min_date is None or d < min_date:
+            min_date = d
+        if max_date is None or d > max_date:
+            max_date = d
+
+        coin = (row.get("Coin") or row.get("Asset") or "").strip()
+        if coin:
+            assets.add(coin.upper())
+
+    # Si on a des dates valides, on précharge les historiques de prix
+    if min_date is not None and max_date is not None:
+        for sym in assets:
+            ensure_coin_history(db, sym, min_date, max_date, base_currency="USD")
+
+    # --- Parsing “réel” des transactions maintenant que les prix sont en base ---
+
     composed_ops: dict[str, dict] = defaultdict(lambda: {
         "datetime": None,
         "account": None,
@@ -399,8 +608,7 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
 
     simple_rows: list[dict] = []  # deposits, withdrawals, income simples
 
-    for row in reader:
-        # Essaye d'être tolérant sur les noms de colonnes
+    for row in rows:
         utc_time = (row.get("UTC_Time")
                     or row.get("Date(UTC)")
                     or row.get("Time")
@@ -419,7 +627,6 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
         try:
             dt = datetime.strptime(utc_time, "%Y-%m-%d %H:%M:%S")
         except ValueError:
-            # tente autre format au cas où
             try:
                 dt = datetime.fromisoformat(utc_time.replace("Z", "+00:00"))
             except Exception:
@@ -434,7 +641,7 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
         op_upper = operation.upper()
         remark_upper = remark.upper()
 
-        # --- Cas simples d'abord : DEPOSIT / WITHDRAW / EARN (INCOME) ---
+        # --- Cas simples : DEPOSIT / WITHDRAW / EARN (INCOME) ---
         if op_upper == "FIAT DEPOSIT" or op_upper == "DEPOSIT":
             simple_rows.append({
                 "datetime": dt,
@@ -465,12 +672,12 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
                 "datetime": dt,
                 "side": "SUBSCRIPTION",
                 "pair": coin,
-                "quantity": qty,  # négatif, c'est ok
+                "quantity": qty,
                 "note": f"{account} | {remark}".strip(" |"),
             })
             continue
 
-        # EARN / INCOME : Binance Earn, Simple Earn, Staking, Launchpool, etc.
+        # EARN / INCOME
         if ("EARN" in remark_upper
             or "SIMPLE EARN" in remark_upper
             or "STAKING" in remark_upper
@@ -485,22 +692,19 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
             })
             continue
 
-        # --- Nouveau bloc : Binance Convert (2 lignes : +asset et -asset) ---
-        # --- Nouveau bloc : Binance Convert (2 lignes : +asset et -asset) ---
+        # --- Binance Convert (2 lignes : +asset et -asset) ---
         if operation == "Binance Convert":
-            # Certaines exports mettent les 2 lignes (EUR -xx / crypto +xx)
-            # à 1 seconde d'écart → on regroupe à la minute.
-            bucket = dt.strftime("%Y-%m-%d %H:%M")  # précision minute
+            bucket = dt.strftime("%Y-%m-%d %H:%M")
             group_key = f"{account}|{bucket}|BINANCE_CONVERT"
 
             comp = composed_ops[group_key]
 
-            # on garde la date la plus récente pour l'op globale
             if comp["datetime"] is None or dt > comp["datetime"]:
                 comp["datetime"] = dt
 
             comp["account"] = account
             comp["remark"] = "Binance Convert"
+            comp["raw_ops"].append(operation)
 
             if qty < 0:
                 comp["spends"].append((coin, qty))
@@ -509,8 +713,7 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
 
             continue
 
-        # --- Cas composés : Transaction Spend / Buy / Fee / Convert / Trade ---
-        # On groupe par account + timestamp + remark (clé empirique mais efficace)
+        # --- Cas composés : Transaction Spend / Buy / Fee / etc. ---
         group_key = f"{account}|{dt.strftime('%Y-%m-%d %H:%M:%S')}|{remark}"
 
         comp = composed_ops[group_key]
@@ -522,8 +725,6 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
         op_u = operation.upper()
 
         if "TRANSACTION REVENUE" in op_u:
-            # Revenue EUR d'une vente : on la traite comme un "spend" EUR négatif
-            # pour que total_spent_eur = somme des montants en EUR.
             comp["spends"].append((coin, -abs(qty)))
         elif "SPEND" in op_u or "SOLD" in op_u or op_u == "SELL":
             comp["spends"].append((coin, qty))
@@ -532,13 +733,12 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
         elif "FEE" in op_u:
             comp["fees"].append((coin, qty))
         else:
-            # Inclassable -> fallback
             comp["buys"].append((coin, qty))
             comp["raw_ops"].append(f"FALLBACK_OTHER:{operation}")
 
     inserted = 0
 
-    # On insère les simples d'abord (DEPOSIT / WITHDRAW / INCOME)
+    # --- Insertion des simples ---
     for r in simple_rows:
         qty = r["quantity"]
         pair = r["pair"]
@@ -547,7 +747,6 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
         price_eur = r.get("price_eur", 0.0)
         fees_eur = r.get("fees_eur", 0.0)
 
-        # Si c'est de l'EUR qui rentre / sort → on met le montant en price_eur
         if pair == "EUR":
             price_eur = abs(qty)
 
@@ -564,10 +763,9 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
         db.add(tx)
         inserted += 1
 
-    # Puis les opérations composées (Convert, Spend/Buy/Fee groupés)
+    # --- Insertion des opérations composées ---
     usd_stables = {"USDT", "USDC", "BUSD", "USD"}
 
-    # Puis les opérations composées (Convert, Spend/Buy/Fee groupés)
     for key, comp in composed_ops.items():
         dt = comp["datetime"]
         if not dt:
@@ -578,6 +776,7 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
         spends = comp["spends"]
         buys = comp["buys"]
         fees = comp["fees"]
+        raw_ops = comp["raw_ops"]
 
         # ---- EUR direct ----
         total_spent_eur = sum(abs(qty) for coin, qty in spends if coin == "EUR")
@@ -592,12 +791,10 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
         total_spent_eur += usd_spent * fx
         total_fees_eur  += usd_fees * fx
 
-        # -------- from / to assets --------
         # -------- from / to assets (agrégés) --------
         from_asset, from_amount = None, 0.0
         to_asset, to_amount = None, 0.0
 
-        # Agrège tous les spends par 1er asset rencontré (USDT ici)
         for coin, qty in spends:
             if qty < 0:
                 if from_asset is None:
@@ -605,13 +802,24 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
                 if coin == from_asset:
                     from_amount += qty
 
-        # Agrège tous les buys par 1er asset rencontré (BCH ici)
         for coin, qty in buys:
             if qty > 0:
                 if to_asset is None:
                     to_asset = coin
                 if coin == to_asset:
                     to_amount += qty
+
+        # Cas particulier : "Buy Crypto With Fiat" (aucune ligne EUR dans le CSV)
+        if (
+                total_spent_eur == 0
+                and from_asset is None
+                and to_asset is not None
+                and any("BUY CRYPTO WITH FIAT" in op.upper() for op in raw_ops)
+        ):
+            # On reconstruit le prix total en EUR: quantité * prix_jour(BCH_USD) * fx
+            price_usd = get_coin_price_usd(db, to_asset, dt)
+            if price_usd is not None:
+                total_spent_eur = abs(to_amount) * price_usd * fx
 
         fees_summary = ", ".join(f"{c} {qty}" for c, qty in fees)
 
@@ -633,34 +841,28 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
         side = "OTHER"
         pair = to_asset or from_asset or "UNKNOWN"
         quantity = to_amount if to_amount != 0 else from_amount
-        price_eur = 0.0
+        price_eur = total_spent_eur
 
-        # EUR natif (déjà traité) ou via stablecoins
         if from_asset in {"EUR"} | usd_stables and to_asset and to_asset not in {"EUR"} | usd_stables:
-            # achat d'un coin avec EUR / USDT
             side = "BUY"
             pair = to_asset
             quantity = to_amount
-            price_eur = total_spent_eur
 
         elif to_asset in {"EUR"} | usd_stables and from_asset and from_asset not in {"EUR"} | usd_stables:
-            # vente d'un coin contre EUR / USDT
             side = "SELL"
             pair = from_asset
             quantity = from_amount
-            price_eur = total_spent_eur  # valeur vendue
 
         elif from_asset and to_asset:
-            # convert crypto -> crypto
             side = "CONVERT"
             pair = to_asset
             quantity = to_amount
-            # price_eur laissé à 0 pour le moment
 
         elif from_asset and not to_asset:
             side = "SELL"
             pair = from_asset
             quantity = from_amount
+
         elif to_asset and not from_asset:
             side = "BUY"
             pair = to_asset
@@ -672,7 +874,7 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
             pair=pair,
             side=side,
             quantity=quantity,
-            price_eur=price_eur,       # on utilise bien la variable calculée
+            price_eur=price_eur,
             fees_eur=total_fees_eur,
             note=note,
         )

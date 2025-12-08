@@ -26,3 +26,36 @@ class FXRate(Base):
     __table_args__ = (
         UniqueConstraint("date", "base", "quote", name="uq_fxrate_date_pair"),
     )
+
+class CoinMeta(Base):
+    """
+    Mapping entre un symbole (BCH, AVAX, etc.) et l'id de l'API CCC.
+    On peut aussi stocker quelques infos utiles.
+    """
+    __tablename__ = "coin_meta"
+
+    id = Column(Integer, primary_key=True, index=True)
+    api_id = Column(Integer, index=True)      # id = 2487 pour BCH
+    symbol = Column(String(16), index=True)   # "BCH"
+    name = Column(String(128))
+    first_data = Column(Date, nullable=True)
+    most_recent_data = Column(Date, nullable=True)
+    base_currency = Column(String(8), nullable=True)  # "USD" en général
+
+    __table_args__ = (
+        UniqueConstraint("symbol", name="uq_coinmeta_symbol"),
+    )
+
+
+class CoinPrice(Base):
+    __tablename__ = "coin_prices"
+
+    id = Column(Integer, primary_key=True, index=True)
+    date = Column(Date, index=True)           # jour UTC
+    symbol = Column(String(16), index=True)   # "BCH"
+    base = Column(String(8), index=True)      # "USD" ou "EUR"
+    price = Column(Float)                     # 1 coin -> price base
+
+    __table_args__ = (
+        UniqueConstraint("date", "symbol", "base", name="uq_coinprice_date_symbol_base"),
+    )
