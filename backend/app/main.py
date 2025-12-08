@@ -26,9 +26,20 @@ CCC_API_KEY = "912f4971567ad6da574774b52bdd0a5f"
 CCC_API_SECRET = "7cb5e29e15306be715942b8675383e74"
 CCC_BASE_URL = "https://www.cryptocurrencychart.com/api"
 
-FIAT_SYMS = {"EUR", "USD"}
+# ⚠️ Pour la LOI : seuls les FIAT sont "cash" => fait générateur
+FIAT_SYMS = {"EUR", "USD"}          # monnaies ayant cours légal
 STABLE_SYMS = {"USDT", "USDC", "BUSD", "TUSD", "FDUSD"}
-TAX_BASE = FIAT_SYMS | STABLE_SYMS  # tout ce qui compte comme "cash" pour l'imposition
+
+# Ancien comportement "pas de prix CCC pour fiat / stables"
+def is_fiat_or_stable(symbol: str) -> bool:
+    s = (symbol or "").upper()
+    return s in FIAT_SYMS or s in STABLE_SYMS
+
+def is_fiat(symbol: str) -> bool:
+    return (symbol or "").upper() in FIAT_SYMS
+
+def is_stable(symbol: str) -> bool:
+    return (symbol or "").upper() in STABLE_SYMS
 
 # ===================== Helpers FX / prix =====================
 
@@ -415,77 +426,208 @@ def extract_from_to(tx: TransactionDB) -> tuple[str | None, str | None]:
     to_asset = m.group(4)
     return from_asset, to_asset
 
-
 def is_taxable(tx: TransactionDB) -> bool:
     """
-    Imposable = on sort d'une vraie crypto vers du "cash" (EUR / stables USD).
-    On ne regarde que SELL / CONVERT.
+    FR - art. 150 VH bis :
+    Fait générateur = cession d'actifs numériques contre une monnaie FIAT
+    (ou achat de biens/services, qu'on ne sait pas détecter facilement ici).
+
+    Donc :
+      - on ne considère que les SELL
+      - on est imposable si on termine dans du FIAT (EUR, USD, ...)
+      - crypto -> stable (USDT, USDC...) = NON imposable.
     """
     s = normalize_side(tx)
-    if s not in {"SELL", "CONVERT"}:
+    if s != "SELL":
         return False
 
     from_asset, to_asset = extract_from_to(tx)
 
+    # Cas normal : note "From X COIN -> Y EUR"
     if from_asset or to_asset:
-        return (to_asset or "").upper() in TAX_BASE
+        return is_fiat(to_asset)
 
+    # Fallback : pas de note, mais pair = fiat (rare)
     pair = (tx.pair or "").upper()
-    if s == "SELL" and pair in TAX_BASE:
+    if is_fiat(pair):
         return True
 
     return False
 
+def compute_portfolio_value_eur(db: Session,
+                                holdings_qty: dict[str, float],
+                                dt: datetime) -> float:
+    """
+    Valeur globale du portefeuille (en EUR) à la date dt,
+    pour le calcul 150 VH bis.
+
+    On compte :
+      - toutes les cryptos ET stables (actifs numériques)
+      - on exclut les FIAT (EUR, USD...) qui ne sont pas des "actifs numériques".
+    """
+    total = 0.0
+    day = dt
+
+    for sym, qty in holdings_qty.items():
+        if abs(qty) < 1e-12:
+            continue
+
+        s = sym.upper()
+
+        # Les FIAT ne font pas partie du portefeuille d'actifs numériques
+        if is_fiat(s):
+            continue
+
+        # Stables : prix 1 USD
+        if is_stable(s):
+            price_usd = 1.0
+        else:
+            price_usd = get_coin_price_usd(db, s, day)
+            if price_usd is None:
+                continue
+
+        fx = get_usd_eur_rate(db, day)
+        total += qty * price_usd * fx
+
+    return total
 
 def compute_tax_events_all_years(db: Session) -> dict[int, dict]:
+    """
+    Implémentation (approx) de l'article 150 VH bis :
+
+    Pour chaque cession imposable (crypto -> FIAT) :
+
+        PV = C - ( A * C / V )
+
+      - C : prix de cession en EUR (montant FIAT reçu)
+      - V : valeur globale du portefeuille d'actifs numériques
+            juste AVANT la cession (en EUR)
+      - A : prix total d'acquisition net du portefeuille
+            juste AVANT la cession (en EUR)
+
+    Après chaque cession :
+      - on retire du pool une fraction du coût : A <- A - (A * C / V)
+      - le portefeuille en coins est mis à jour (on enlève la quantité vendue).
+    """
+
     txs = (
         db.query(TransactionDB)
         .order_by(TransactionDB.datetime.asc())
         .all()
     )
 
+    # Quantités (crypto + stables) détenues
     holdings_qty: dict[str, float] = defaultdict(float)
-    holdings_cost: dict[str, float] = defaultdict(float)
+
+    # Prix total d'acquisition global (A) en EUR
+    acquisition_cost_eur: float = 0.0
+
     cum_pv_by_year: dict[int, float] = defaultdict(float)
     events_by_id: dict[int, dict] = {}
 
     for tx in txs:
-        side = normalize_side(tx)
+        side_norm = normalize_side(tx)
         asset = (tx.pair or "").upper()
         if not asset:
             continue
 
         qty = tx.quantity or 0.0
-        trade_value = tx.price_eur or 0.0
+        trade_value_eur = tx.price_eur or 0.0
         year = tx.datetime.year
 
-        # acquisitions crypto (hors cash)
-        if side in {"BUY", "DEPOSIT", "INCOME"} and asset not in TAX_BASE:
-            if qty < 0:
-                qty = -qty
-            holdings_qty[asset] += qty
-            holdings_cost[asset] += abs(trade_value)
+        from_asset, to_asset = extract_from_to(tx)
+        from_asset = (from_asset or "").upper()
+        to_asset = (to_asset or "").upper()
+
+        # ---------- 1) Cas NON imposables : mise à jour du pool ----------
+        # 1.a) Achats de crypto avec FIAT => augmentent A
+        if side_norm == "BUY":
+            # Achat via "From XXX FIAT -> YYY COIN"
+            if is_fiat(from_asset) and not is_fiat(asset):
+                # pool de coins
+                holdings_qty[asset] += abs(qty)
+                # coût d'acquisition : montant FIAT dépensé
+                acquisition_cost_eur += abs(trade_value_eur)
+                continue
+
+            # Cas "Buy Crypto With Fiat" sans from_asset explicite
+            note_lower = (tx.note or "").lower()
+            if "buy crypto with fiat" in note_lower and not is_fiat(asset):
+                holdings_qty[asset] += abs(qty)
+                acquisition_cost_eur += abs(trade_value_eur)
+                continue
+
+            # Achat crypto-crypto (ex: USDT -> ALT) => CONVERT au sens de la loi
+            # => ne modifie PAS A, seulement la composition du portefeuille
+            if from_asset and not is_fiat(from_asset) and to_asset:
+                # on considère que le parser de note a trouvé from/to
+                if from_asset:
+                    holdings_qty[from_asset] -= abs(qty)   # approx
+                if to_asset:
+                    holdings_qty[to_asset] += abs(qty)
+                continue
+
+            # fallback : on considère que c'est un simple ajout de crypto
+            holdings_qty[asset] += abs(qty)
             continue
 
-        # évènements imposables : SELL vers cash
-        if side == "SELL" and is_taxable(tx) and asset not in TAX_BASE:
+        # 1.b) Dépôts / INCOME / airdrops -> acquisition à titre gratuit
+        if side_norm == "DEPOSIT":
+            # gains d'intérêt / staking etc. : coût d'acquisition = 0
+            holdings_qty[asset] += abs(qty)
+            # acquisition_cost_eur ne bouge pas
+            continue
+
+        # 1.c) Conversions crypto-crypto (neutres fiscalement)
+        if side_norm == "CONVERT":
+            # on ajuste juste les quantités, A ne change pas
+            m = DIRECTION_RE.search(tx.note or "")
+            if m:
+                from_amount = float(m.group(1))
+                from_sym = m.group(2).upper()
+                to_amount = float(m.group(3))
+                to_sym = m.group(4).upper()
+
+                if not is_fiat(from_sym):
+                    holdings_qty[from_sym] -= abs(from_amount)
+                if not is_fiat(to_sym):
+                    holdings_qty[to_sym] += abs(to_amount)
+            else:
+                # au pire, on traite le pair comme une entrée
+                holdings_qty[asset] += abs(qty)
+            continue
+
+        # 1.d) Withdrawals de crypto / transferts sortants : on enlève des coins
+        if side_norm == "WITHDRAWAL" and not is_fiat(asset):
+            holdings_qty[asset] -= abs(qty)
+            continue
+
+        # ---------- 2) Cas imposables : SELL vers FIAT ----------
+        if side_norm == "SELL" and is_taxable(tx) and not is_fiat(asset):
+            # quantité vendue (on force le signe)
             if qty > 0:
                 qty = -qty
             qty_sold = abs(qty)
 
-            prev_qty = holdings_qty[asset]
-            prev_cost = holdings_cost[asset]
-            unit_cost = prev_cost / prev_qty if prev_qty > 0 else 0.0
+            # Valeur de cession C en EUR (montant FIAT reçu)
+            C = abs(trade_value_eur)
 
-            cost_out = unit_cost * qty_sold
-            proceeds = abs(trade_value)
-            pv = proceeds - cost_out
+            # Valeur globale du portefeuille V juste AVANT la vente
+            V = compute_portfolio_value_eur(db, holdings_qty, tx.datetime)
 
-            new_qty = max(prev_qty - qty_sold, 0.0)
-            new_cost = max(prev_cost - cost_out, 0.0)
-            holdings_qty[asset] = new_qty
-            holdings_cost[asset] = new_cost
+            if V <= 0 or acquisition_cost_eur <= 0:
+                # pas de base de coût connue → on considère tout en PV brute
+                pv = C
+                allocated_cost = 0.0
+            else:
+                allocated_cost = acquisition_cost_eur * (C / V)
+                pv = C - allocated_cost
 
+            # Mise à jour du pool après la cession
+            holdings_qty[asset] -= qty_sold
+            acquisition_cost_eur = max(acquisition_cost_eur - allocated_cost, 0.0)
+
+            # cumul annuel
             cum_pv_by_year[year] += pv
             cum_pv_year = cum_pv_by_year[year]
             est_tax = max(cum_pv_year, 0.0) * 0.30
@@ -494,12 +636,21 @@ def compute_tax_events_all_years(db: Session) -> dict[int, dict]:
                 "id": tx.id,
                 "datetime": tx.datetime,
                 "pair": asset,
-                "side": side,
-                "proceeds_eur": proceeds,
+                "side": side_norm,
+                "proceeds_eur": C,
                 "pv_eur": pv,
                 "cum_pv_year_eur": cum_pv_year,
                 "estimated_tax_eur": est_tax,
             }
+
+            continue
+
+        # Le reste (SELL non imposables, OTHER…) : on peut réduire le pool
+        if side_norm == "SELL" and not is_fiat(asset):
+            if qty > 0:
+                qty = -qty
+            holdings_qty[asset] += qty  # qty est négatif
+            continue
 
     return events_by_id
 
@@ -810,7 +961,6 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
         account_upper = account.upper()
         remark_upper = remark.upper()
 
-        # 🔥 Ignore tout ce qui est dérivés (USD-M / COIN-M Futures)
         if "FUTURES" in account_upper or "FUTURES" in remark_upper:
             continue
 
@@ -1047,32 +1197,36 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
             note_parts.append(f"Fees: {fees_summary}")
         note = " | ".join(note_parts) if note_parts else None
 
+        # -------- Classification + affectation du price_eur --------
         side = "OTHER"
         pair = to_asset or from_asset or "UNKNOWN"
         quantity = to_amount if to_amount != 0 else from_amount
-        price_eur = 0.0
+        price_eur = 0.0  # on choisira ensuite
 
-        # BUY crypto contre cash
-        if from_asset in {"EUR"} | usd_stables and to_asset and to_asset not in {"EUR"} | usd_stables:
+        # BUY : crypto achetée contre FIAT (EUR, USD...)
+        if is_fiat(from_asset) and to_asset and not is_fiat(to_asset):
             side = "BUY"
             pair = to_asset
             quantity = to_amount
+            # montant dépensé = jambe "spends" (FIAT)
             price_eur = total_spent_eur or total_received_eur
 
-        # SELL crypto contre cash
-        elif to_asset in {"EUR"} | usd_stables and from_asset and from_asset not in {"EUR"} | usd_stables:
+        # SELL : crypto vendue contre FIAT
+        elif is_fiat(to_asset) and from_asset and not is_fiat(from_asset):
             side = "SELL"
             pair = from_asset
             quantity = from_amount
+            # montant reçu = jambe "buys" (FIAT)
             price_eur = total_received_eur or total_spent_eur
 
-        # CONVERT crypto-crypto
+        # CONVERT crypto <-> crypto (y compris stables)
         elif from_asset and to_asset:
             side = "CONVERT"
             pair = to_asset
             quantity = to_amount
 
         elif to_asset and not from_asset:
+            # fallback : achat de crypto (fiat implicite ou autre)
             side = "BUY"
             pair = to_asset
             quantity = to_amount
