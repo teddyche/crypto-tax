@@ -61,28 +61,6 @@ const TYPE_FILTERS = [
   { value: "OTHER", label: "Autre" },
 ];
 
-function isTransactionTaxable(tx) {
-  const side = (tx.side || "").toUpperCase();
-  const direction = tx.direction || "";
-
-  // Dépôts / retraits / earn / subscr. → jamais imposables directement
-  if (["DEPOSIT", "WITHDRAWAL", "INCOME", "SUBSCRIPTION"].includes(side)) {
-    return false;
-  }
-
-  // On parse "FROM -> TO"
-  const parts = direction.split("->").map((s) => s.trim());
-  const toAsset = parts[1] || null;
-
-  // Imposable uniquement quand on ressort en EUR
-  if (toAsset === "EUR") {
-    return true;
-  }
-
-  // Par défaut : non imposable
-  return false;
-}
-
 function App() {
   const [transactions, setTransactions] = useState([]);
   const [summary, setSummary] = useState({
@@ -97,7 +75,7 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [loadingSummary, setLoadingSummary] = useState(false);
 
-  // Filtres
+  // Filtres année / actif
   const [years, setYears] = useState([]);
   const [assets, setAssets] = useState([]);
   const [selectedYear, setSelectedYear] = useState("all");
@@ -106,7 +84,7 @@ function App() {
   // Filtre de type (multi)
   const [selectedTypes, setSelectedTypes] = useState([]);
 
-  // Filtre Imposition (all | yes | no)
+  // 🆕 Filtre d’imposition : "all" | "taxable" | "non_taxable"
   const [taxFilter, setTaxFilter] = useState("all");
 
   // Pagination
@@ -172,7 +150,6 @@ function App() {
       setYears(newYears);
       setAssets(newAssets);
 
-      // Si l’année / l’actif sélectionné n’existe plus, reset
       if (selectedYear !== "all" && !newYears.includes(Number(selectedYear))) {
         setSelectedYear("all");
       }
@@ -227,23 +204,21 @@ function App() {
     return Math.max(1, Math.ceil(total / pageSize));
   }, [summary.total_transactions, pageSize]);
 
-  // Transactions après filtre imposition (sur la page courante)
-  const displayedTransactions = useMemo(() => {
-    if (taxFilter === "yes") {
-      return transactions.filter((t) => isTransactionTaxable(t));
+  // 🆕 transactions filtrées par imposition
+  const filteredTransactions = useMemo(() => {
+    if (taxFilter === "all") return transactions;
+    if (taxFilter === "taxable") {
+      return transactions.filter((tx) => tx.taxable);
     }
-    if (taxFilter === "no") {
-      return transactions.filter((t) => !isTransactionTaxable(t));
-    }
-    return transactions;
+    return transactions.filter((tx) => !tx.taxable);
   }, [transactions, taxFilter]);
 
   // --- useEffects ---
 
-  // Reset page quand les filtres changent
+  // Reset page quand filtres changent
   useEffect(() => {
     setPage(1);
-  }, [selectedYear, selectedAsset, selectedTypes, taxFilter, pageSize]);
+  }, [selectedYear, selectedAsset, selectedTypes, pageSize, taxFilter]);
 
   // Filtres croisés (années <-> actifs)
   useEffect(() => {
@@ -493,7 +468,7 @@ function App() {
               </div>
             </div>
 
-            {/* Imposition */}
+            {/* 🆕 Filtre imposition */}
             <div className="flex flex-col text-xs gap-1">
               <span className="text-slate-400 uppercase tracking-wide">
                 IMPOSITION
@@ -513,11 +488,11 @@ function App() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => setTaxFilter("yes")}
+                  onClick={() => setTaxFilter("taxable")}
                   className={classNames(
                     "px-3 py-1 rounded-full text-[11px] border transition",
-                    taxFilter === "yes"
-                      ? "bg-emerald-500/20 border-emerald-400 text-emerald-100"
+                    taxFilter === "taxable"
+                      ? "bg-slate-100 text-slate-900 border-slate-100"
                       : "bg-slate-900 border-slate-600 text-slate-300 hover:border-slate-400"
                   )}
                 >
@@ -525,11 +500,11 @@ function App() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => setTaxFilter("no")}
+                  onClick={() => setTaxFilter("non_taxable")}
                   className={classNames(
                     "px-3 py-1 rounded-full text-[11px] border transition",
-                    taxFilter === "no"
-                      ? "bg-emerald-500/20 border-emerald-400 text-emerald-100"
+                    taxFilter === "non_taxable"
+                      ? "bg-slate-100 text-slate-900 border-slate-100"
                       : "bg-slate-900 border-slate-600 text-slate-300 hover:border-slate-400"
                   )}
                 >
@@ -596,7 +571,7 @@ function App() {
                 <span>
                   Affichage de{" "}
                   <span className="text-slate-200 font-medium">
-                    {displayedTransactions.length}
+                    {filteredTransactions.length}
                   </span>{" "}
                   lignes
                 </span>
@@ -666,7 +641,9 @@ function App() {
                   </th>
                   <th className="px-3 py-2 text-right font-medium">Quantité</th>
                   <th className="px-3 py-2 text-right font-medium">Prix EUR</th>
-                  <th className="px-3 py-2 text-right font-medium">Frais EUR</th>
+                  <th className="px-3 py-2 text-right font-medium">
+                    Frais EUR
+                  </th>
                   <th className="px-4 py-2 text-left font-medium">Note</th>
                 </tr>
               </thead>
@@ -680,7 +657,7 @@ function App() {
                       Chargement…
                     </td>
                   </tr>
-                ) : displayedTransactions.length === 0 ? (
+                ) : filteredTransactions.length === 0 ? (
                   <tr>
                     <td
                       colSpan={9}
@@ -690,8 +667,7 @@ function App() {
                     </td>
                   </tr>
                 ) : (
-                  displayedTransactions.map((tx) => {
-                    const taxable = isTransactionTaxable(tx);
+                  filteredTransactions.map((tx) => {
                     const sideUpper = (tx.side || "").toUpperCase();
                     const badgeClass =
                       TYPE_BADGE_COLORS[sideUpper] ||
@@ -710,17 +686,22 @@ function App() {
                         <td className="px-4 py-2 text-slate-300 whitespace-nowrap">
                           {formatDate(tx.datetime)}
                         </td>
+
+                        {/* Imposable */}
                         <td className="px-3 py-2 text-center">
-                          {taxable ? (
-                            <span className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-emerald-500/10 border border-emerald-500/50 text-emerald-400 text-[11px]">
-                              ✔
-                            </span>
-                          ) : (
-                            <span className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-red-500/5 border border-red-500/40 text-red-400 text-[11px]">
-                              ✘
-                            </span>
-                          )}
+                          <span
+                            className={classNames(
+                              "inline-flex h-5 w-5 items-center justify-center rounded-full border text-[10px]",
+                              tx.taxable
+                                ? "bg-emerald-500/10 border-emerald-400 text-emerald-300"
+                                : "bg-slate-900 border-slate-600 text-slate-500"
+                            )}
+                          >
+                            {tx.taxable ? "✔" : "✕"}
+                          </span>
                         </td>
+
+                        {/* Type */}
                         <td className="px-3 py-2">
                           <span
                             className={classNames(
@@ -731,12 +712,18 @@ function App() {
                             {formatSideLabel(sideUpper)}
                           </span>
                         </td>
+
+                        {/* Pair / Coin */}
                         <td className="px-3 py-2 text-slate-200">
                           {tx.pair || "—"}
                         </td>
-                        <td className="px-3 py-2 text-slate-300 whitespace-nowrap">
+
+                        {/* Vers / Depuis */}
+                        <td className="px-3 py-2 text-slate-400">
                           {tx.direction || "—"}
                         </td>
+
+                        {/* Quantité */}
                         <td
                           className={classNames(
                             "px-3 py-2 text-right tabular-nums",
@@ -747,6 +734,8 @@ function App() {
                             maximumFractionDigits: 8,
                           }) || "0"}
                         </td>
+
+                        {/* Prix EUR */}
                         <td className="px-3 py-2 text-right text-slate-400 tabular-nums">
                           {tx.price_eur
                             ? tx.price_eur.toLocaleString("fr-FR", {
@@ -755,6 +744,8 @@ function App() {
                               }) + " €"
                             : "0,00 €"}
                         </td>
+
+                        {/* Frais EUR */}
                         <td className="px-3 py-2 text-right text-slate-400 tabular-nums">
                           {tx.fees_eur
                             ? tx.fees_eur.toLocaleString("fr-FR", {
@@ -763,6 +754,8 @@ function App() {
                               }) + " €"
                             : "0,00 €"}
                         </td>
+
+                        {/* Note */}
                         <td className="px-4 py-2 text-slate-400 max-w-xs truncate">
                           {tx.note || "—"}
                         </td>

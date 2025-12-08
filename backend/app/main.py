@@ -27,6 +27,7 @@ CCC_BASE_URL = "https://www.cryptocurrencychart.com/api"
 
 FIAT_SYMS = {"EUR", "USD"}
 STABLE_SYMS = {"USDT", "USDC", "BUSD", "TUSD", "FDUSD"}
+TAXABLE_OUT_SYMS = {"EUR", "USDT", "USDC"}
 
 def is_fiat_or_stable(symbol: str) -> bool:
     s = (symbol or "").upper()
@@ -533,9 +534,12 @@ def extract_from_to(tx: TransactionDB) -> tuple[str | None, str | None]:
 
 def is_taxable(tx: TransactionDB) -> bool:
     """
-    Approximation FR : imposable seulement quand on sort vers l'EUR.
-    - SELL vers EUR
-    - CONVERT où l'une des jambes est EUR (cas rare, normalement classé SELL/BUY)
+    Approximation FR : on considère imposable uniquement quand on sort
+    d'un coin vers EUR / stable (USDT, USDC…).
+
+    - SELL : on suppose que c'est une vente de crypto -> EUR / stable
+    - CONVERT : imposable uniquement si la jambe de destination est EUR / stable
+      (cas très rare normalement, la plupart sont classées BUY/SELL).
     """
     s = normalize_side(tx)
     if s not in {"SELL", "CONVERT"}:
@@ -543,13 +547,23 @@ def is_taxable(tx: TransactionDB) -> bool:
 
     from_asset, to_asset = extract_from_to(tx)
 
-    if from_asset == "EUR" or to_asset == "EUR":
+    # Si on a bien un "From X -> Y"
+    if to_asset:
+        to_sym = to_asset.upper()
+
+        # Taxable seulement si on FINIT en EUR / stable
+        if to_sym in TAXABLE_OUT_SYMS:
+            return True
+
+        # Exemple à ne PAS taxer : EUR -> BCH (to_sym = BCH)
+        return False
+
+    # Pas de direction exploitable dans la note :
+    # pour nos SELL reconstruits, on sait que c'est crypto -> EUR / stable
+    if s == "SELL":
         return True
 
-    # Cas ultra simple : si note absente mais pair == "EUR" (devrait peu arriver)
-    if tx.pair.upper() == "EUR":
-        return True
-
+    # CONVERT sans direction claire : on ne le taxe pas
     return False
 
 
@@ -672,8 +686,8 @@ def list_transactions(
                 price_eur=tx.price_eur,
                 fees_eur=tx.fees_eur,
                 note=tx.note,
-                taxable=is_taxable(tx),          # 🆕
-                direction=get_direction_label(tx) # 🆕
+                taxable=is_taxable(tx),
+                direction=get_direction_label(tx),
             )
         )
     return out
