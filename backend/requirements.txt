@@ -4,3 +4,4 @@ psycopg[binary]
 SQLAlchemy
 python-dotenv
 python-multipart
+requests
