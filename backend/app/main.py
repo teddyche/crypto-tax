@@ -674,3 +674,72 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
 
     db.commit()
     return {"inserted": inserted}
+
+from xml.etree import ElementTree as ET
+from datetime import datetime, date
+
+@app.post("/import/fx-usdeur")
+async def import_fx_usdeur(
+        file: UploadFile = File(...),
+        db: Session = Depends(get_db),
+):
+    """
+    Importe un fichier XML ECB contenant les taux USD/EUR journaliers.
+    On ne garde que la série CURRENCY=USD / CURRENCY_DENOM=EUR.
+    """
+
+    content = await file.read()
+    # Parse XML
+    tree = ET.fromstring(content)
+
+    # Namespace ECB (présent dans ton fichier)
+    NS = {"exr": "http://www.ecb.europa.eu/vocabulary/stats/exr/1"}
+
+    # On va chercher les Series
+    series_list = tree.findall(".//exr:Series", NS)
+
+    if not series_list:
+        return {"inserted": 0, "detail": "Aucune série trouvée"}
+
+    inserted = 0
+
+    for series in series_list:
+        attrs = series.attrib
+        curr = attrs.get("CURRENCY")
+        denom = attrs.get("CURRENCY_DENOM")
+
+        # On ne prend que USD/EUR
+        if curr != "USD" or denom != "EUR":
+            continue
+
+        # Pour éviter les doublons brutaux, on peut supprimer l'ancien jeu
+        db.query(FXRate).filter(
+            FXRate.base == "USD",
+            FXRate.quote == "EUR",
+            ).delete()
+
+        # Chaque Obs = 1 jour de taux
+        for obs in series.findall("exr:Obs", NS):
+            d_str = obs.attrib.get("TIME_PERIOD")
+            v_str = obs.attrib.get("OBS_VALUE")
+
+            if not d_str or not v_str:
+                continue
+
+            try:
+                d = datetime.strptime(d_str, "%Y-%m-%d").date()
+                rate = float(v_str)
+            except Exception:
+                continue
+
+            fx = FXRate(
+                date=d,
+                base="USD",
+                quote="EUR",
+                rate=rate,
+            )
+            db.add(fx)
+            inserted += 1
+
+    db.commit()
+    return {"inserted": inserted}
