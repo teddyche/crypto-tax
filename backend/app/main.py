@@ -341,11 +341,9 @@ def normalize_side(tx: TransactionDB) -> str:
     if "deposit" in note:
         return "DEPOSIT"
 
-    if raw == "SUBSCRIPTION":
+    # 6. Flux Earn internes : on les CACHE
+    if raw in {"SUBSCRIPTION", "EARN_RETURN"}:
         return "HIDDEN"
-
-    if raw == "EARN_RETURN":
-        return "TRANSFER"
 
     return "OTHER"
 
