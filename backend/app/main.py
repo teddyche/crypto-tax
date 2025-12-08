@@ -341,6 +341,9 @@ def normalize_side(tx: TransactionDB) -> str:
     if "deposit" in note:
         return "DEPOSIT"
 
+    if raw == "SUBSCRIPTION":
+        return "HIDDEN"
+
     return "OTHER"
 
 
@@ -414,6 +417,14 @@ def list_transactions(
 
     # 1. On récupère toutes les lignes correspondantes à année/asset
     rows = query.order_by(TransactionDB.datetime.desc()).all()
+
+    normalized_rows = []
+    for tx in rows:
+        side_norm = normalize_side(tx)
+        if side_norm == "HIDDEN":  # 👈 ON CACHE
+            continue
+        normalized_rows.append(tx)
+    rows = normalized_rows
 
     # 2. Filtre par type (sur la version normalisée)
     if types:
