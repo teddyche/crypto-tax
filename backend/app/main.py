@@ -344,6 +344,9 @@ def normalize_side(tx: TransactionDB) -> str:
     if raw == "SUBSCRIPTION":
         return "HIDDEN"
 
+    if raw == "EARN_RETURN":
+        return "TRANSFER"
+
     return "OTHER"
 
 
@@ -672,6 +675,19 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
                 "quantity": qty,
                 "note": f"{account} | {remark}".strip(" |"),
                 "price_eur": abs(qty) if coin == "EUR" else 0.0,
+                "fees_eur": 0.0,
+            })
+            continue
+
+        # Simple Earn Flexible Redemption  → transfert interne (non taxable)
+        if "SIMPLE EARN FLEXIBLE REDEMPTION" in op_upper:
+            simple_rows.append({
+                "datetime": dt,
+                "side": "EARN_RETURN",
+                "pair": coin,
+                "quantity": qty,
+                "note": f"{account} | {remark}".strip(" |"),
+                "price_eur": 0.0,
                 "fees_eur": 0.0,
             })
             continue
