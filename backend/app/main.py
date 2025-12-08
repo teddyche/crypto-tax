@@ -1107,14 +1107,24 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
 
         op_u = operation.upper()
 
+        op_u = operation.upper()
+
+        # 🟢 USDT qu'on reçoit quand on vend NEO, etc.
         if "TRANSACTION REVENUE" in op_u:
-            comp["spends"].append((coin, -abs(qty)))
+            # c'est ce qu'on reçoit -> côté BUY
+            comp["buys"].append((coin, abs(qty)))
+
+        # 🔴 Coin qu'on vend (NEO ici)
         elif "SPEND" in op_u or "SOLD" in op_u or op_u == "SELL":
+            # qty est déjà négative dans le CSV -> on garde tel quel
             comp["spends"].append((coin, qty))
+
         elif "BUY" in op_u:
             comp["buys"].append((coin, qty))
+
         elif "FEE" in op_u:
             comp["fees"].append((coin, qty))
+
         else:
             comp["buys"].append((coin, qty))
             comp["raw_ops"].append(f"FALLBACK_OTHER:{operation}")
