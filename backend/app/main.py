@@ -435,24 +435,27 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
         remark_upper = remark.upper()
 
         # --- Cas simples d'abord : DEPOSIT / WITHDRAW / EARN (INCOME) ---
-        if op_upper == "DEPOSIT":
+        if op_upper == "FIAT DEPOSIT" or op_upper == "DEPOSIT":
             simple_rows.append({
                 "datetime": dt,
                 "side": "DEPOSIT",
                 "pair": coin,
                 "quantity": qty,
                 "note": f"{account} | {remark}".strip(" |"),
+                "price_eur": abs(qty) if coin == "EUR" else 0.0,
+                "fees_eur": 0.0,
             })
             continue
 
         if op_upper == "WITHDRAW":
-            # Binance indique souvent "Withdraw fee is included" dans Remark
             simple_rows.append({
                 "datetime": dt,
                 "side": "WITHDRAWAL",
                 "pair": coin,
-                "quantity": qty,  # déjà négatif, frais inclus
+                "quantity": qty,
                 "note": f"{account} | {remark}".strip(" |"),
+                "price_eur": abs(qty) if coin == "EUR" else 0.0,
+                "fees_eur": 0.0,
             })
             continue
 
@@ -518,15 +521,19 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
 
         op_u = operation.upper()
 
-        if "SPEND" in op_u or op_u == "SELL":
+        if "TRANSACTION REVENUE" in op_u:
+            # Revenue EUR d'une vente : on la traite comme un "spend" EUR négatif
+            # pour que total_spent_eur = somme des montants en EUR.
+            comp["spends"].append((coin, -abs(qty)))
+        elif "SPEND" in op_u or "SOLD" in op_u or op_u == "SELL":
             comp["spends"].append((coin, qty))
         elif "BUY" in op_u:
             comp["buys"].append((coin, qty))
         elif "FEE" in op_u:
             comp["fees"].append((coin, qty))
         else:
-            # Inclassable -> on le gardera en OTHER plus bas
-            comp["buys"].append((coin, qty))  # fallback
+            # Inclassable -> fallback
+            comp["buys"].append((coin, qty))
             comp["raw_ops"].append(f"FALLBACK_OTHER:{operation}")
 
     inserted = 0
@@ -537,8 +544,8 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
         pair = r["pair"]
         side = r["side"]
 
-        price_eur = 0.0
-        fees_eur = 0.0
+        price_eur = r.get("price_eur", 0.0)
+        fees_eur = r.get("fees_eur", 0.0)
 
         # Si c'est de l'EUR qui rentre / sort → on met le montant en price_eur
         if pair == "EUR":
@@ -658,7 +665,7 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
             pair=pair,
             side=side,
             quantity=quantity,
-            price_eur=total_spent_eur,
+            price_eur=price_eur,       # on utilise bien la variable calculée
             fees_eur=total_fees_eur,
             note=note,
         )
