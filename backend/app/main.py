@@ -524,127 +524,116 @@ def get_summary(
         total_convert=total_convert,
     )
 
-@app.get("/tax/{year}", response_model=TaxYearOut)
+@app.get("/tax/{year}")
 def compute_tax(year: int, db: Session = Depends(get_db)):
     """
-    Calcul V1 de la plus-value imposable pour une année donnée, façon loi FR crypto :
+    Calcul simplifié des plus-values :
+      - moyenne d'achat par actif (average cost per coin)
+      - évènements taxables = SELL (y compris vers USDT/USDC/BUSD/EUR)
+      - WITHDRAWAL = transfert (ignoré)
+      - SUBSCRIPTION / EARN_RETURN / CONVERT = ignorés pour la fiscalité
 
-      - On rejoue TOUT l'historique des transactions dans l'ordre.
-      - On maintient :
-          A = coût d'acquisition global (en EUR)
-          holdings[sym] = quantité détenue de chaque coin
-      - Événements taxables pris en compte : SELL uniquement (V1 simplifiée).
-      - Formule de la PV par opération :
-            PV = P - A * (P / V)
-        avec :
-            P = produit de cession (proceeds) net des frais
-            V = valeur de marché totale du portefeuille juste avant la cession
+    ATTENTION : ce n'est PAS la méthode exacte française (valeur globale du portefeuille),
+    mais un modèle cohérent et vérifiable coin par coin.
     """
 
-    # 1. On récupère tout l'historique, trié chronologiquement
+    # On prend toutes les transactions jusqu'à fin de l'année pour avoir l'historique complet
+    end_dt = datetime(year, 12, 31, 23, 59, 59)
+
     txs = (
         db.query(TransactionDB)
+        .filter(TransactionDB.datetime <= end_dt)
         .order_by(TransactionDB.datetime.asc())
         .all()
     )
 
-    holdings: dict[str, float] = {}   # symbol -> quantité
-    A: float = 0.0                    # coût d'acquisition global
-    total_pv_year: float = 0.0
-    events: list[TaxEventOut] = []
+    # Position et coût moyen par actif
+    holdings_qty: dict[str, float] = defaultdict(float)
+    holdings_cost: dict[str, float] = defaultdict(float)
+
+    events: list[dict] = []
+    total_pv_eur = 0.0
 
     for tx in txs:
-        raw_side = (tx.side or "").upper()
-        pair = (tx.pair or "").upper()
-        dt = tx.datetime
-        price_eur = tx.price_eur or 0.0
-        fees_eur = tx.fees_eur or 0.0
+        side = normalize_side(tx)      # BUY / SELL / DEPOSIT / WITHDRAWAL / CONVERT / OTHER / HIDDEN / TRANSFER
+        asset = (tx.pair or "").upper()
+        if not asset:
+            continue
+
+        # On ignore explicitement ce qu'on a marqué comme caché / transfert interne
+        if side in {"HIDDEN", "TRANSFER"}:
+            continue
+
         qty = tx.quantity or 0.0
-
-        # ------------- 1) Mise à jour des quantités détenues -------------
-        # BUY / DEPOSIT / INCOME / WITHDRAWAL impactent le stock du coin.
-        if raw_side in {"BUY", "DEPOSIT", "INCOME"}:
-            holdings[pair] = holdings.get(pair, 0.0) + qty
-        elif raw_side in {"SELL", "WITHDRAWAL"}:
-            holdings[pair] = holdings.get(pair, 0.0) + qty
-        # SUBSCRIPTION / EARN_RETURN / CONVERT / OTHER : ignorés pour V1 sur les quantités
-
-        # ------------- 2) Mise à jour du coût d'acquisition global A -------------
-        # V1 : on ne considère comme "investissement nouveau" que les BUY.
-        # - BUY : achat de crypto contre EUR/stable -> A augmente de coût + fees
-        # - DEPOSIT : souvent dépôt depuis ailleurs (cold wallet, autre CEX) -> on ne l'intègre pas à A
-        # - INCOME : serait normalement un revenu séparé, on ne l'ajoute pas à A en V1
-        if raw_side == "BUY" and price_eur > 0:
-            A += price_eur + fees_eur
-
-        # ------------- 3) Événement taxable ? (V1 : uniquement SELL) -------------
-        if raw_side != "SELL":
-            continue  # on ignore CONVERT en V1 pour rester simple
-
-        if price_eur <= 0:
+        if qty == 0:
             continue
 
-        # Produit de cession P = prix - frais (net vendeur)
-        P = max(price_eur - fees_eur, 0.0)
+        trade_value = tx.price_eur or 0.0  # valeur totale en EUR (pas prix unitaire)
 
-        # ------------- 4) Calcul de V (valeur de marché du portefeuille) -------------
-        V = 0.0
-        for sym, q in holdings.items():
-            if q <= 0:
-                continue
-
-            sym = sym.upper()
-
-            # Dans ta V1, holdings contient surtout des cryptos, pas d'EUR.
-            # Si un jour tu stockes aussi les stables/EUR dans holdings:
-            if sym == "EUR":
-                V += q
-                continue
-            if sym in STABLE_SYMS:
-                # Les stables sont approximés à 1 EUR pièce (V1)
-                V += q
-                continue
-
-            # Sinon : crypto -> on utilise prix USD * fx
-            price_usd = get_coin_price_usd(db, sym, dt)
-            if not price_usd:
-                continue
-            fx = get_usd_eur_rate(db, dt)
-            V += q * price_usd * fx
-
-        # Si on n'a pas de base pour le calcul, on saute
-        if V <= 0 or A <= 0:
+        # ----- ACQUISITIONS (on augmente le pool) -----
+        if side in {"BUY", "DEPOSIT", "INCOME"}:
+            # qty positive (on reçoit)
+            if qty < 0:
+                qty = -qty
+            holdings_qty[asset] += qty
+            holdings_cost[asset] += abs(trade_value)
             continue
 
-        # ------------- 5) Formule FR de la PV -------------
-        fraction = P / V
-        pv = P - A * fraction
+        # ----- VENTES (évènements taxables) -----
+        if side == "SELL":
+            # on vend → qty doit être négative dans le CSV, on convertit
+            if qty > 0:
+                qty = -qty
+            qty_sold = abs(qty)
 
-        # Mise à jour de A après la cession
-        A = A - A * fraction
+            prev_qty = holdings_qty[asset]
+            prev_cost = holdings_cost[asset]
 
-        # ------------- 6) Si l'opé est dans l'année demandée, on l'enregistre -------------
-        if dt.year == year:
-            total_pv_year += pv
-            events.append(
-                TaxEventOut(
-                    id=tx.id,
-                    datetime=dt,
-                    pair=tx.pair,
-                    side="SELL",
-                    proceeds_eur=P,
-                    pv_eur=pv,
+            if prev_qty > 0:
+                unit_cost = prev_cost / prev_qty
+            else:
+                # aucun historique → on considère coût nul (toute la vente est PV)
+                unit_cost = 0.0
+
+            cost_out = unit_cost * qty_sold
+            proceeds = abs(trade_value)    # montant de la vente en EUR
+            pv = proceeds - cost_out       # plus-value (peut être négative)
+
+            # On met à jour la position résiduelle
+            new_qty = max(prev_qty - qty_sold, 0.0)
+            new_cost = max(prev_cost - cost_out, 0.0)
+
+            holdings_qty[asset] = new_qty
+            holdings_cost[asset] = new_cost
+
+            # On ne comptabilise la PV que si la vente est dans l'année demandée
+            if tx.datetime.year == year:
+                total_pv_eur += pv
+                events.append(
+                    {
+                        "id": tx.id,
+                        "datetime": tx.datetime,
+                        "pair": asset,
+                        "side": side,
+                        "proceeds_eur": proceeds,
+                        "pv_eur": pv,
+                    }
                 )
-            )
 
-    flat_tax = total_pv_year * 0.30 if total_pv_year > 0 else 0.0
+            continue
 
-    return TaxYearOut(
-        year=year,
-        total_pv_eur=total_pv_year,
-        flat_tax_30=flat_tax,
-        events=events,
-    )
+        # ----- Le reste : WITHDRAWAL, CONVERT, OTHER, etc. -----
+        # -> ignorés pour la fiscalité dans cette version
+        continue
+
+    flat_tax_30 = total_pv_eur * 0.30 if total_pv_eur > 0 else 0.0
+
+    return {
+        "year": year,
+        "total_pv_eur": total_pv_eur,
+        "flat_tax_30": flat_tax_30,
+        "events": events,
+    }
 # ---------- Création manuelle ----------
 
 @app.post("/transactions", response_model=TransactionOut)
