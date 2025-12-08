@@ -1140,25 +1140,21 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
 
         op_u = operation.upper()
 
-        # 🟢 USDT qu'on reçoit quand on vend NEO, etc.
-        if "TRANSACTION REVENUE" in op_u:
-            # c'est ce qu'on reçoit -> côté BUY
-            comp["buys"].append((coin, abs(qty)))
-
-        # 🔴 Coin qu'on vend (NEO ici)
-        elif "SPEND" in op_u or "SOLD" in op_u or op_u == "SELL":
-            # qty est déjà négative dans le CSV -> on garde tel quel
-            comp["spends"].append((coin, qty))
-
-        elif "BUY" in op_u:
-            comp["buys"].append((coin, qty))
-
-        elif "FEE" in op_u:
-            comp["fees"].append((coin, qty))
-
-        else:
-            comp["buys"].append((coin, qty))
-            comp["raw_ops"].append(f"FALLBACK_OTHER:{operation}")
+    # PATCH : reclassification des lignes composées
+    if "TRANSACTION REVENUE" in op_u:
+        # C'est ce que tu REÇOIS (USDT, EUR...) -> jambe "to"
+        comp["buys"].append((coin, abs(qty)))
+    elif "SPEND" in op_u or "SOLD" in op_u or op_u == "SELL":
+        # Ce que tu VENDS -> jambe "from"
+        comp["spends"].append((coin, qty))
+    elif "BUY" in op_u:
+        # Cas "Transaction Buy" classique
+        comp["buys"].append((coin, qty))
+    elif "FEE" in op_u:
+        comp["fees"].append((coin, qty))
+    else:
+        comp["buys"].append((coin, qty))
+        comp["raw_ops"].append(f"FALLBACK_OTHER:{operation}")
 
     inserted = 0
 
@@ -1220,7 +1216,7 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
 
         # ---- EUR direct ----
         total_spent_eur = sum(abs(qty) for coin, qty in spends if coin == "EUR")
-        total_fees_eur = sum(abs(qty) for coin, qty in fees if coin == "EUR")
+        total_fees_eur  = sum(abs(qty) for coin, qty in fees   if coin == "EUR")
 
         # ---- USD / stablecoins -> EUR via fx table ----
         usd_spent = sum(abs(qty) for coin, qty in spends if coin in usd_stables)
@@ -1230,6 +1226,11 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
 
         total_spent_eur += usd_spent * fx
         total_fees_eur  += usd_fees * fx
+
+        # PATCH : montant reçu en EUR (jambe "buys")
+        total_received_eur = sum(abs(qty) for coin, qty in buys if coin == "EUR")
+        usd_received = sum(abs(qty) for coin, qty in buys if coin in usd_stables)
+        total_received_eur += usd_received * fx
 
         # -------- from / to assets (agrégés) --------
         from_asset, from_amount = None, 0.0
@@ -1281,27 +1282,30 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
         side = "OTHER"
         pair = to_asset or from_asset or "UNKNOWN"
         quantity = to_amount if to_amount != 0 else from_amount
-        price_eur = total_spent_eur
+        price_eur = 0.0  # on choisira ensuite
 
+        # BUY : on dépense du fiat/stable, on reçoit de la crypto
         if from_asset in {"EUR"} | usd_stables and to_asset and to_asset not in {"EUR"} | usd_stables:
             side = "BUY"
             pair = to_asset
             quantity = to_amount
+            # montant dépensé = jambe "spends"
+            price_eur = total_spent_eur or total_received_eur
 
+        # SELL : on vend de la crypto contre du fiat/stable
         elif to_asset in {"EUR"} | usd_stables and from_asset and from_asset not in {"EUR"} | usd_stables:
             side = "SELL"
             pair = from_asset
             quantity = from_amount
+            # montant reçu = jambe "buys"
+            price_eur = total_received_eur or total_spent_eur
 
+        # CONVERT crypto-crypto
         elif from_asset and to_asset:
             side = "CONVERT"
             pair = to_asset
             quantity = to_amount
-
-        elif from_asset and not to_asset:
-            side = "SELL"
-            pair = from_asset
-            quantity = from_amount
+            # on laissera le fallback prix_jour plus bas
 
         elif to_asset and not from_asset:
             side = "BUY"
