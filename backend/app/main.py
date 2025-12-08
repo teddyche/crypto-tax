@@ -738,7 +738,10 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
     inserted = 0
 
     # --- Insertion des simples ---
+    usd_stables = {"USDT", "USDC", "BUSD", "USD"}  # tu peux remonter ça en haut si tu veux
+
     for r in simple_rows:
+        dt = r["datetime"]
         qty = r["quantity"]
         pair = r["pair"]
         side = r["side"]
@@ -746,11 +749,24 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
         price_eur = r.get("price_eur", 0.0)
         fees_eur = r.get("fees_eur", 0.0)
 
+        # Si c'est de l'EUR qui rentre / sort → montant en EUR direct
         if pair == "EUR":
             price_eur = abs(qty)
 
+        # 💰 Fallback pour dépôts / retraits / income en crypto :
+        # on valorise à prix_jour(coin_USD) * fx * quantité
+        if (
+                price_eur == 0
+                and pair not in {"EUR"} | usd_stables
+                and side in {"DEPOSIT", "WITHDRAWAL", "INCOME"}
+        ):
+            price_usd = get_coin_price_usd(db, pair, dt)
+            if price_usd is not None:
+                fx = get_usd_eur_rate(db, dt)
+                price_eur = abs(qty) * price_usd * fx
+
         tx = TransactionDB(
-            datetime=r["datetime"],
+            datetime=dt,
             exchange="Binance",
             pair=pair,
             side=side,
