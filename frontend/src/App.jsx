@@ -84,6 +84,9 @@ function App() {
   // Filtre de type (multi)
   const [selectedTypes, setSelectedTypes] = useState([]);
 
+  // Filtre Imposition (all | yes | no)
+  const [taxFilter, setTaxFilter] = useState("all");
+
   // Pagination
   const [pageSize, setPageSize] = useState(100);
   const [page, setPage] = useState(1);
@@ -202,12 +205,23 @@ function App() {
     return Math.max(1, Math.ceil(total / pageSize));
   }, [summary.total_transactions, pageSize]);
 
+  // Transactions après filtre imposition (sur la page courante)
+  const displayedTransactions = useMemo(() => {
+    if (taxFilter === "yes") {
+      return transactions.filter((t) => t.taxable);
+    }
+    if (taxFilter === "no") {
+      return transactions.filter((t) => !t.taxable);
+    }
+    return transactions;
+  }, [transactions, taxFilter]);
+
   // --- useEffects ---
 
   // Reset page quand les filtres changent
   useEffect(() => {
     setPage(1);
-  }, [selectedYear, selectedAsset, selectedTypes, pageSize]);
+  }, [selectedYear, selectedAsset, selectedTypes, taxFilter, pageSize]);
 
   // Filtres croisés (années <-> actifs)
   useEffect(() => {
@@ -456,7 +470,52 @@ function App() {
                 })}
               </div>
             </div>
-           </div> {/* <-- ferme le <div className="flex flex-col gap-3"> */}
+
+            {/* Imposition */}
+            <div className="flex flex-col text-xs gap-1">
+              <span className="text-slate-400 uppercase tracking-wide">
+                IMPOSITION
+              </span>
+              <div className="flex flex-wrap gap-2 mt-1">
+                <button
+                  type="button"
+                  onClick={() => setTaxFilter("all")}
+                  className={classNames(
+                    "px-3 py-1 rounded-full text-[11px] border transition",
+                    taxFilter === "all"
+                      ? "bg-emerald-500/20 border-emerald-400 text-emerald-100"
+                      : "bg-slate-900 border-slate-600 text-slate-300 hover:border-slate-400"
+                  )}
+                >
+                  Toutes
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTaxFilter("yes")}
+                  className={classNames(
+                    "px-3 py-1 rounded-full text-[11px] border transition",
+                    taxFilter === "yes"
+                      ? "bg-emerald-500/20 border-emerald-400 text-emerald-100"
+                      : "bg-slate-900 border-slate-600 text-slate-300 hover:border-slate-400"
+                  )}
+                >
+                  Imposables
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTaxFilter("no")}
+                  className={classNames(
+                    "px-3 py-1 rounded-full text-[11px] border transition",
+                    taxFilter === "no"
+                      ? "bg-emerald-500/20 border-emerald-400 text-emerald-100"
+                      : "bg-slate-900 border-slate-600 text-slate-300 hover:border-slate-400"
+                  )}
+                >
+                  Non imposables
+                </button>
+              </div>
+            </div>
+          </div>
 
           {/* Upload CSV */}
           <div className="flex items-start gap-3">
@@ -515,7 +574,7 @@ function App() {
                 <span>
                   Affichage de{" "}
                   <span className="text-slate-200 font-medium">
-                    {transactions.length}
+                    {displayedTransactions.length}
                   </span>{" "}
                   lignes
                 </span>
@@ -573,9 +632,15 @@ function App() {
               <thead className="bg-slate-900/80 border-b border-slate-800">
                 <tr className="text-[11px] uppercase tracking-wide text-slate-500">
                   <th className="px-4 py-2 text-left font-medium">Date</th>
+                  <th className="px-3 py-2 text-center font-medium">
+                    Imposable
+                  </th>
                   <th className="px-3 py-2 text-left font-medium">Type</th>
                   <th className="px-3 py-2 text-left font-medium">
                     Pair / Coin
+                  </th>
+                  <th className="px-3 py-2 text-left font-medium">
+                    Vers / Depuis
                   </th>
                   <th className="px-3 py-2 text-right font-medium">Quantité</th>
                   <th className="px-3 py-2 text-right font-medium">Prix EUR</th>
@@ -587,23 +652,23 @@ function App() {
                 {loading ? (
                   <tr>
                     <td
-                      colSpan={7}
+                      colSpan={9}
                       className="px-4 py-6 text-center text-slate-500"
                     >
                       Chargement…
                     </td>
                   </tr>
-                ) : transactions.length === 0 ? (
+                ) : displayedTransactions.length === 0 ? (
                   <tr>
                     <td
-                      colSpan={7}
+                      colSpan={9}
                       className="px-4 py-6 text-center text-slate-500"
                     >
                       Aucune transaction pour ce filtre.
                     </td>
                   </tr>
                 ) : (
-                  transactions.map((tx) => {
+                  displayedTransactions.map((tx) => {
                     const sideUpper = (tx.side || "").toUpperCase();
                     const badgeClass =
                       TYPE_BADGE_COLORS[sideUpper] ||
@@ -622,6 +687,17 @@ function App() {
                         <td className="px-4 py-2 text-slate-300 whitespace-nowrap">
                           {formatDate(tx.datetime)}
                         </td>
+                        <td className="px-3 py-2 text-center">
+                          {tx.taxable ? (
+                            <span className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-emerald-500/10 border border-emerald-500/50 text-emerald-400 text-[11px]">
+                              ✔
+                            </span>
+                          ) : (
+                            <span className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-red-500/5 border border-red-500/40 text-red-400 text-[11px]">
+                              ✘
+                            </span>
+                          )}
+                        </td>
                         <td className="px-3 py-2">
                           <span
                             className={classNames(
@@ -634,6 +710,9 @@ function App() {
                         </td>
                         <td className="px-3 py-2 text-slate-200">
                           {tx.pair || "—"}
+                        </td>
+                        <td className="px-3 py-2 text-slate-300 whitespace-nowrap">
+                          {tx.direction || "—"}
                         </td>
                         <td
                           className={classNames(

@@ -13,6 +13,12 @@ from sqlalchemy.orm import Session
 from .db import Base, engine, SessionLocal
 from .models import TransactionDB, FXRate, CoinMeta, CoinPrice
 
+import re
+
+DIRECTION_RE = re.compile(
+    r"From\s+([-\d\.]+)\s+([A-Z0-9]+)\s+->\s+([-\d\.]+)\s+([A-Z0-9]+)"
+)
+
 # ---------- CryptoCurrencyChart API (historique de prix) ----------
 
 CCC_API_KEY = "912f4971567ad6da574774b52bdd0a5f"
@@ -258,6 +264,10 @@ class TransactionOut(BaseModel):
     price_eur: float | None = None
     fees_eur: float | None = None
     note: str | None = None
+
+    # 🆕
+    taxable: bool
+    direction: str | None = None
 
     class Config:
         from_attributes = True
@@ -509,6 +519,54 @@ def normalize_side(tx: TransactionDB) -> str:
 
     return "OTHER"
 
+def extract_from_to(tx: TransactionDB) -> tuple[str | None, str | None]:
+    """
+    Extrait (from_asset, to_asset) depuis la note "From X COIN -> Y COIN2".
+    """
+    m = DIRECTION_RE.search(tx.note or "")
+    if not m:
+        return None, None
+    from_asset = m.group(2)
+    to_asset = m.group(4)
+    return from_asset, to_asset
+
+
+def is_taxable(tx: TransactionDB) -> bool:
+    """
+    Approximation FR : imposable seulement quand on sort vers l'EUR.
+    - SELL vers EUR
+    - CONVERT où l'une des jambes est EUR (cas rare, normalement classé SELL/BUY)
+    """
+    s = normalize_side(tx)
+    if s not in {"SELL", "CONVERT"}:
+        return False
+
+    from_asset, to_asset = extract_from_to(tx)
+
+    if from_asset == "EUR" or to_asset == "EUR":
+        return True
+
+    # Cas ultra simple : si note absente mais pair == "EUR" (devrait peu arriver)
+    if tx.pair.upper() == "EUR":
+        return True
+
+    return False
+
+
+def get_direction_label(tx: TransactionDB) -> str | None:
+    """
+    Texte "Vers/Depuis" pour affichage UI.
+    """
+    s = normalize_side(tx)
+    from_asset, to_asset = extract_from_to(tx)
+
+    if s == "BUY" and from_asset:
+        return f"Depuis {from_asset}"
+    if s == "SELL" and to_asset:
+        return f"Vers {to_asset}"
+    if s == "CONVERT" and from_asset and to_asset:
+        return f"{from_asset} → {to_asset}"
+    return None
 
 # ---------- Routes simples ----------
 
@@ -614,6 +672,8 @@ def list_transactions(
                 price_eur=tx.price_eur,
                 fees_eur=tx.fees_eur,
                 note=tx.note,
+                taxable=is_taxable(tx),          # 🆕
+                direction=get_direction_label(tx) # 🆕
             )
         )
     return out
