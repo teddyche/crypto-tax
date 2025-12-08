@@ -282,6 +282,23 @@ class SummaryOut(BaseModel):
     total_withdrawal: int
     total_convert: int
 
+class TaxEventOut(BaseModel):
+    id: int
+    datetime: datetime
+    pair: str
+    side: str
+    proceeds_eur: float
+    pv_eur: float
+
+    class Config:
+        from_attributes = True
+
+
+class TaxYearOut(BaseModel):
+    year: int
+    total_pv_eur: float
+    flat_tax_30: float
+    events: List[TaxEventOut]
 
 # ---------- DB utils ----------
 
@@ -507,7 +524,127 @@ def get_summary(
         total_convert=total_convert,
     )
 
+@app.get("/tax/{year}", response_model=TaxYearOut)
+def compute_tax(year: int, db: Session = Depends(get_db)):
+    """
+    Calcul V1 de la plus-value imposable pour une année donnée, façon loi FR crypto :
 
+      - On rejoue TOUT l'historique des transactions dans l'ordre.
+      - On maintient :
+          A = coût d'acquisition global (en EUR)
+          holdings[sym] = quantité détenue de chaque coin
+      - Événements taxables pris en compte : SELL uniquement (V1 simplifiée).
+      - Formule de la PV par opération :
+            PV = P - A * (P / V)
+        avec :
+            P = produit de cession (proceeds) net des frais
+            V = valeur de marché totale du portefeuille juste avant la cession
+    """
+
+    # 1. On récupère tout l'historique, trié chronologiquement
+    txs = (
+        db.query(TransactionDB)
+        .order_by(TransactionDB.datetime.asc())
+        .all()
+    )
+
+    holdings: dict[str, float] = {}   # symbol -> quantité
+    A: float = 0.0                    # coût d'acquisition global
+    total_pv_year: float = 0.0
+    events: list[TaxEventOut] = []
+
+    for tx in txs:
+        raw_side = (tx.side or "").upper()
+        pair = (tx.pair or "").upper()
+        dt = tx.datetime
+        price_eur = tx.price_eur or 0.0
+        fees_eur = tx.fees_eur or 0.0
+        qty = tx.quantity or 0.0
+
+        # ------------- 1) Mise à jour des quantités détenues -------------
+        # BUY / DEPOSIT / INCOME / WITHDRAWAL impactent le stock du coin.
+        if raw_side in {"BUY", "DEPOSIT", "INCOME"}:
+            holdings[pair] = holdings.get(pair, 0.0) + qty
+        elif raw_side in {"SELL", "WITHDRAWAL"}:
+            holdings[pair] = holdings.get(pair, 0.0) + qty
+        # SUBSCRIPTION / EARN_RETURN / CONVERT / OTHER : ignorés pour V1 sur les quantités
+
+        # ------------- 2) Mise à jour du coût d'acquisition global A -------------
+        # V1 : on ne considère comme "investissement nouveau" que les BUY.
+        # - BUY : achat de crypto contre EUR/stable -> A augmente de coût + fees
+        # - DEPOSIT : souvent dépôt depuis ailleurs (cold wallet, autre CEX) -> on ne l'intègre pas à A
+        # - INCOME : serait normalement un revenu séparé, on ne l'ajoute pas à A en V1
+        if raw_side == "BUY" and price_eur > 0:
+            A += price_eur + fees_eur
+
+        # ------------- 3) Événement taxable ? (V1 : uniquement SELL) -------------
+        if raw_side != "SELL":
+            continue  # on ignore CONVERT en V1 pour rester simple
+
+        if price_eur <= 0:
+            continue
+
+        # Produit de cession P = prix - frais (net vendeur)
+        P = max(price_eur - fees_eur, 0.0)
+
+        # ------------- 4) Calcul de V (valeur de marché du portefeuille) -------------
+        V = 0.0
+        for sym, q in holdings.items():
+            if q <= 0:
+                continue
+
+            sym = sym.upper()
+
+            # Dans ta V1, holdings contient surtout des cryptos, pas d'EUR.
+            # Si un jour tu stockes aussi les stables/EUR dans holdings:
+            if sym == "EUR":
+                V += q
+                continue
+            if sym in STABLE_SYMS:
+                # Les stables sont approximés à 1 EUR pièce (V1)
+                V += q
+                continue
+
+            # Sinon : crypto -> on utilise prix USD * fx
+            price_usd = get_coin_price_usd(db, sym, dt)
+            if not price_usd:
+                continue
+            fx = get_usd_eur_rate(db, dt)
+            V += q * price_usd * fx
+
+        # Si on n'a pas de base pour le calcul, on saute
+        if V <= 0 or A <= 0:
+            continue
+
+        # ------------- 5) Formule FR de la PV -------------
+        fraction = P / V
+        pv = P - A * fraction
+
+        # Mise à jour de A après la cession
+        A = A - A * fraction
+
+        # ------------- 6) Si l'opé est dans l'année demandée, on l'enregistre -------------
+        if dt.year == year:
+            total_pv_year += pv
+            events.append(
+                TaxEventOut(
+                    id=tx.id,
+                    datetime=dt,
+                    pair=tx.pair,
+                    side="SELL",
+                    proceeds_eur=P,
+                    pv_eur=pv,
+                )
+            )
+
+    flat_tax = total_pv_year * 0.30 if total_pv_year > 0 else 0.0
+
+    return TaxYearOut(
+        year=year,
+        total_pv_eur=total_pv_year,
+        flat_tax_30=flat_tax,
+        events=events,
+    )
 # ---------- Création manuelle ----------
 
 @app.post("/transactions", response_model=TransactionOut)
