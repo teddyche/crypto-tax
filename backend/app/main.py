@@ -807,6 +807,13 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
         change_str = (row.get("Change") or row.get("Amount") or "0").strip()
         remark = (row.get("Remark") or row.get("Notes") or "").strip()
 
+        account_upper = account.upper()
+        remark_upper = remark.upper()
+
+        # 🔥 Ignore tout ce qui est dérivés (USD-M / COIN-M Futures)
+        if "FUTURES" in account_upper or "FUTURES" in remark_upper:
+            continue
+
         if not utc_time or not operation:
             continue
 
