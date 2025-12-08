@@ -26,9 +26,13 @@ CCC_API_KEY = "912f4971567ad6da574774b52bdd0a5f"
 CCC_API_SECRET = "7cb5e29e15306be715942b8675383e74"
 CCC_BASE_URL = "https://www.cryptocurrencychart.com/api"
 
-# ⚠️ Pour la LOI : seuls les FIAT sont "cash" => fait générateur
-FIAT_SYMS = {"EUR", "USD"}          # monnaies ayant cours légal
+# Fiat = monnaies légales (fait générateur)
+FIAT_SYMS = {"EUR", "USD"}
+
+# Stables = toujours du crypto (NON imposable quand tu y passes)
 STABLE_SYMS = {"USDT", "USDC", "BUSD", "TUSD", "FDUSD"}
+
+# Tout ce qui n'est PAS fiat = actif numérique au sens 150 VH bis
 
 TYPE_MAP = {
     "ACHAT": "BUY",
@@ -449,32 +453,28 @@ def extract_from_to(tx: TransactionDB) -> tuple[str | None, str | None]:
 
 def is_taxable(tx: TransactionDB) -> bool:
     """
-    FR - art. 150 VH bis :
-    Fait générateur = cession d'actifs numériques contre une monnaie FIAT
-    (ou achat de biens/services, qu'on ne sait pas détecter facilement ici).
-
-    Donc :
-      - on ne considère que les SELL
-      - on est imposable si on termine dans du FIAT (EUR, USD, ...)
-      - crypto -> stable (USDT, USDC...) = NON imposable.
+    Fait générateur FR : cession d'un actif numérique contre une MONNAIE FIAT.
+    - Crypto -> EUR / USD etc.  => imposable
+    - Crypto -> stablecoin      => NON imposable
+    - Crypto -> crypto          => NON imposable
     """
     s = normalize_side(tx)
-    if s != "SELL":
+    if s not in {"SELL", "CONVERT"}:
         return False
 
     from_asset, to_asset = extract_from_to(tx)
-
-    # Cas normal : note "From X COIN -> Y EUR"
-    if from_asset or to_asset:
-        return is_fiat(to_asset)
-
-    # Fallback : pas de note, mais pair = fiat (rare)
     pair = (tx.pair or "").upper()
-    if is_fiat(pair):
+
+    # Cas principal : on a un "From X COIN -> Y COIN2" dans la note
+    if to_asset:
+        return to_asset.upper() in FIAT_SYMS
+
+    # Fallback ultra simple : pour certaines lignes on n'a pas la note,
+    # mais la paire est directement une monnaie fiat.
+    if s == "SELL" and pair in FIAT_SYMS:
         return True
 
     return False
-
 def compute_portfolio_value_eur(
         db: Session,
         holdings_qty: dict[str, float],
@@ -527,22 +527,155 @@ def compute_portfolio_value_eur(
 
 from sqlalchemy import func
 
+def portfolio_value_eur(db: Session, holdings: dict[str, float], dt: datetime) -> float:
+    """
+    Valeur globale du portefeuille (toutes les cryptos, y compris stables) en EUR,
+    à une date donnée (approx = prix jour CCC + FX USD/EUR).
+    """
+    if not holdings:
+        return 0.0
+
+    fx = get_usd_eur_rate(db, dt)
+    total = 0.0
+
+    for sym, qty in holdings.items():
+        if abs(qty) < 1e-12:
+            continue
+
+        sym_u = sym.upper()
+        if sym_u in FIAT_SYMS:
+            # On ne compte PAS les fiat dans le portefeuille crypto
+            continue
+
+        price_usd = get_coin_price_usd(db, sym_u, dt)
+        if price_usd is None:
+            continue
+
+        total += qty * price_usd * fx
+
+    return max(total, 0.0)
+
 def compute_tax_events_all_years(db: Session) -> dict[int, dict]:
     """
-    Wrapper avec cache en mémoire.
-    On ne recalcule la fiscalité que si le nombre de transactions a changé
-    (i.e. nouvel import / purge).
+    Implémente la méthode FR 150 VH bis (portefeuille global).
+
+    État suivi dans la boucle chronologique :
+      - holdings_qty[sym]   : quantités de chaque actif numérique
+      - total_acq_cost_eur  : prix total d'acquisition NET du portefeuille (en EUR)
+      - cum_pv_by_year[y]   : PV cumulée de l'année y
+      - cum_proceeds_by_year[y] : total des cessions imposables de l'année y
+
+    Pour chaque cession imposable (crypto -> fiat) :
+      PV = Prix de cession - ( total_acq_cost * Prix de cession / Valeur_portefeuille_avant )
     """
-    global _tax_cache
+    txs = (
+        db.query(TransactionDB)
+        .order_by(TransactionDB.datetime.asc())
+        .all()
+    )
 
-    tx_count = db.query(func.count(TransactionDB.id)).scalar() or 0
+    from collections import defaultdict
 
-    if _tax_cache["events"] is None or _tax_cache["tx_count"] != tx_count:
-        events = _compute_tax_events_all_years_internal(db)
-        _tax_cache["events"] = events
-        _tax_cache["tx_count"] = tx_count
+    holdings_qty: dict[str, float] = defaultdict(float)
+    total_acq_cost_eur: float = 0.0
 
-    return _tax_cache["events"]  # dict {tx_id: {...}}
+    cum_pv_by_year: dict[int, float] = defaultdict(float)
+    cum_proceeds_by_year: dict[int, float] = defaultdict(float)
+
+    events_by_id: dict[int, dict] = {}
+
+    for tx in txs:
+        s = normalize_side(tx)
+        pair = (tx.pair or "").upper()
+        qty = tx.quantity or 0.0
+        value_eur = tx.price_eur or 0.0
+        dt = tx.datetime
+        year = dt.year
+        note = tx.note or ""
+
+        from_asset, to_asset = extract_from_to(tx)
+
+        # ---------- 1) Cession imposable ? ----------
+        taxable = is_taxable(tx)
+
+        if taxable:
+            # Prix de cession = montant en fiat reçu (en EUR si possible)
+            proceeds = abs(value_eur)
+
+            # Valeur globale du portefeuille AVANT cession
+            port_value = portfolio_value_eur(db, holdings_qty, dt)
+
+            if port_value > 0 and total_acq_cost_eur > 0:
+                allocated_cost = total_acq_cost_eur * (proceeds / port_value)
+            else:
+                allocated_cost = 0.0
+
+            pv = proceeds - allocated_cost
+
+            # Mise à jour des agrégats annuels
+            cum_pv_by_year[year] += pv
+            cum_proceeds_by_year[year] += proceeds
+
+            # Règle des 305 € : si total des cessions <= 305 €, impôt = 0
+            if cum_proceeds_by_year[year] <= 305:
+                est_tax = 0.0
+            else:
+                est_tax = max(cum_pv_by_year[year], 0.0) * 0.30
+
+            events_by_id[tx.id] = {
+                "id": tx.id,
+                "datetime": dt,
+                "pair": pair,
+                "side": s,
+                "proceeds_eur": proceeds,
+                "pv_eur": pv,
+                "cum_pv_year_eur": cum_pv_by_year[year],
+                "estimated_tax_eur": est_tax,
+            }
+
+            # Après la cession, le prix total d'acquisition diminue
+            total_acq_cost_eur = max(total_acq_cost_eur - allocated_cost, 0.0)
+
+        # ---------- 2) Entrées de fiat dans le portefeuille (achat crypto) ----------
+        # On augmente le prix total d'acquisition quand on ACHÈTE de la crypto avec de la FIAT.
+        if s in {"BUY", "CONVERT"} and from_asset in FIAT_SYMS and to_asset and to_asset.upper() not in FIAT_SYMS:
+            # value_eur représente normalement le montant de fiat dépensé
+            total_acq_cost_eur += abs(value_eur)
+
+        # ---------- 3) Mise à jour des quantités détenues ----------
+        # (on considère tout, y compris les stables, pour la valorisation)
+        if s in {"BUY", "DEPOSIT", "INCOME"}:
+            if pair not in FIAT_SYMS:
+                holdings_qty[pair] += abs(qty)
+
+        elif s in {"SELL", "WITHDRAWAL"}:
+            if pair not in FIAT_SYMS:
+                holdings_qty[pair] -= abs(qty)
+
+        elif s == "CONVERT":
+            # On se base sur la note "From X COIN -> Y COIN2"
+            m = DIRECTION_RE.search(note)
+            if m:
+                from_amount = float(m.group(1))
+                from_sym = m.group(2).upper()
+                to_amount = float(m.group(3))
+                to_sym = m.group(4).upper()
+
+                if from_sym not in FIAT_SYMS:
+                    holdings_qty[from_sym] += from_amount  # from_amount est déjà négatif
+                if to_sym not in FIAT_SYMS:
+                    holdings_qty[to_sym] += to_amount
+            else:
+                # Fallback si on n'a pas réussi à parser
+                if pair not in FIAT_SYMS:
+                    holdings_qty[pair] += qty
+
+        # On nettoie les petits résidus flottants
+        for sym in list(holdings_qty.keys()):
+            if abs(holdings_qty[sym]) < 1e-12:
+                holdings_qty.pop(sym, None)
+
+    return events_by_id
 
 def _compute_tax_events_all_years_internal(db: Session) -> dict[int, dict]:
     """
@@ -885,30 +1018,38 @@ def get_daily_portfolio(
 @app.get("/tax/{year}")
 def compute_tax(year: int, db: Session = Depends(get_db)):
     events_by_id = compute_tax_events_all_years(db)
-    year_events = [e for e in events_by_id.values() if e["datetime"].year == year]
+
+    year_events = [
+        e for e in events_by_id.values()
+        if e["datetime"].year == year
+    ]
 
     total_proceeds = sum(e["proceeds_eur"] for e in year_events)
     total_pv = sum(e["pv_eur"] for e in year_events)
 
     if total_proceeds <= 305:
-        flat_tax = 0.0
+        flat_tax_30 = 0.0
     else:
-        flat_tax = max(total_pv, 0.0) * 0.30
+        flat_tax_30 = max(total_pv, 0.0) * 0.30
+
+    events_out = [
+        {
+            "id": e["id"],
+            "datetime": e["datetime"],
+            "pair": e["pair"],
+            "side": e["side"],
+            "proceeds_eur": e["proceeds_eur"],
+            "pv_eur": e["pv_eur"],
+        }
+        for e in year_events
+    ]
 
     return {
         "year": year,
         "total_proceeds_eur": total_proceeds,
         "total_pv_eur": total_pv,
-        "flat_tax_30": flat_tax,
-        "events": [
-            {
-                "id": e["id"],
-                "datetime": e["datetime"],
-                "pair": e["pair"],
-                "proceeds_eur": e["proceeds_eur"],
-                "pv_eur": e["pv_eur"],
-            } for e in year_events
-        ]
+        "flat_tax_30": flat_tax_30,
+        "events": events_out,
     }
 
 # ===================== CRUD simple =====================
