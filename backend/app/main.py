@@ -768,6 +768,7 @@ def list_transactions(
         year: int | None = Query(None),
         asset: str | None = Query(None),
         types: List[str] | None = Query(None),
+        taxable: str | None = Query(None),  # NEW: 'true', 'false', None
         db: Session = Depends(get_db),
 ):
     query = db.query(TransactionDB)
@@ -780,49 +781,47 @@ def list_transactions(
 
     rows = query.order_by(TransactionDB.datetime.desc()).all()
 
-    normalized_rows = []
-    for tx in rows:
-        side_norm = normalize_side(tx)
-        if side_norm == "HIDDEN":
-            continue
-        normalized_rows.append(tx)
-    rows = normalized_rows
-
+    # Normalize types
+    normalized_rows = [tx for tx in rows if normalize_side(tx) != "HIDDEN"]
     if types:
-        allowed = {TYPE_MAP.get(t.upper(), t.upper()) for t in types}
-        rows = [tx for tx in rows if normalize_side(tx) in allowed]
+        allowed = {t.upper() for t in types}
+        normalized_rows = [
+            tx for tx in normalized_rows
+            if normalize_side(tx) in allowed
+        ]
 
-    start = offset
-    end = offset + limit
-    page_rows = rows[start:end]
-
+    # Compute tax events BEFORE filtering
     tax_events = compute_tax_events_all_years(db)
 
-    out: list[TransactionOut] = []
-    for tx in page_rows:
-        normalized = normalize_side(tx)
-        tax_info = tax_events.get(tx.id)
+    # Filter TAXABLE ONLY after knowing PV result
+    if taxable:
+        if taxable == "true":
+            normalized_rows = [tx for tx in normalized_rows if tx.id in tax_events]
+        elif taxable == "false":
+            normalized_rows = [tx for tx in normalized_rows if tx.id not in tax_events]
 
+    # Pagination
+    paged = normalized_rows[offset:offset + limit]
+
+    out = []
+    for tx in paged:
+        tax_info = tax_events.get(tx.id)
         out.append(
             TransactionOut(
                 id=tx.id,
                 datetime=tx.datetime,
                 exchange=tx.exchange,
                 pair=tx.pair,
-                side=normalized,
+                side=normalize_side(tx),
                 quantity=tx.quantity,
                 price_eur=tx.price_eur,
                 fees_eur=tx.fees_eur,
                 note=tx.note,
-                taxable=is_taxable(tx),
+                taxable=(tx.id in tax_events),
                 direction=get_direction_label(tx),
                 pv_eur=(tax_info["pv_eur"] if tax_info else None),
-                cum_pv_year_eur=(
-                    tax_info["cum_pv_year_eur"] if tax_info else None
-                ),
-                estimated_tax_eur=(
-                    tax_info["estimated_tax_eur"] if tax_info else None
-                ),
+                cum_pv_year_eur=(tax_info["cum_pv_year_eur"] if tax_info else None),
+                estimated_tax_eur=(tax_info["estimated_tax_eur"] if tax_info else None),
             )
         )
     return out
@@ -886,32 +885,30 @@ def get_daily_portfolio(
 @app.get("/tax/{year}")
 def compute_tax(year: int, db: Session = Depends(get_db)):
     events_by_id = compute_tax_events_all_years(db)
+    year_events = [e for e in events_by_id.values() if e["datetime"].year == year]
 
-    year_events = [
-        e for e in events_by_id.values()
-        if e["datetime"].year == year
-    ]
+    total_proceeds = sum(e["proceeds_eur"] for e in year_events)
+    total_pv = sum(e["pv_eur"] for e in year_events)
 
-    total_pv_eur = sum(e["pv_eur"] for e in year_events)
-    flat_tax_30 = max(total_pv_eur, 0.0) * 0.30
-
-    events_out = [
-        {
-            "id": e["id"],
-            "datetime": e["datetime"],
-            "pair": e["pair"],
-            "side": e["side"],
-            "proceeds_eur": e["proceeds_eur"],
-            "pv_eur": e["pv_eur"],
-        }
-        for e in year_events
-    ]
+    if total_proceeds <= 305:
+        flat_tax = 0.0
+    else:
+        flat_tax = max(total_pv, 0.0) * 0.30
 
     return {
         "year": year,
-        "total_pv_eur": total_pv_eur,
-        "flat_tax_30": flat_tax_30,
-        "events": events_out,
+        "total_proceeds_eur": total_proceeds,
+        "total_pv_eur": total_pv,
+        "flat_tax_30": flat_tax,
+        "events": [
+            {
+                "id": e["id"],
+                "datetime": e["datetime"],
+                "pair": e["pair"],
+                "proceeds_eur": e["proceeds_eur"],
+                "pv_eur": e["pv_eur"],
+            } for e in year_events
+        ]
     }
 
 # ===================== CRUD simple =====================
