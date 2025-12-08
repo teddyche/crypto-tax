@@ -22,7 +22,6 @@ CCC_BASE_URL = "https://www.cryptocurrencychart.com/api"
 FIAT_SYMS = {"EUR", "USD"}
 STABLE_SYMS = {"USDT", "USDC", "BUSD", "TUSD", "FDUSD"}
 
-
 def is_fiat_or_stable(symbol: str) -> bool:
     s = (symbol or "").upper()
     return s in FIAT_SYMS or s in STABLE_SYMS
@@ -135,7 +134,7 @@ def ensure_coin_history(
         # Coin pas dispo chez CCC
         return
 
-    base_currency = meta.base_currency or base_currency
+    base_currency = "USD"
 
     # Ce qu'on a déjà
     existing_min, existing_max = db.query(
