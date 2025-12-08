@@ -593,18 +593,25 @@ async def import_binance(file: UploadFile = File(...), db: Session = Depends(get
         total_fees_eur  += usd_fees * fx
 
         # -------- from / to assets --------
+        # -------- from / to assets (agrégés) --------
         from_asset, from_amount = None, 0.0
         to_asset, to_amount = None, 0.0
 
+        # Agrège tous les spends par 1er asset rencontré (USDT ici)
         for coin, qty in spends:
-            if qty < 0 and from_asset is None:
-                from_asset, from_amount = coin, qty
+            if qty < 0:
+                if from_asset is None:
+                    from_asset = coin
+                if coin == from_asset:
+                    from_amount += qty
 
-        max_buy = 0.0
+        # Agrège tous les buys par 1er asset rencontré (BCH ici)
         for coin, qty in buys:
-            if qty > 0 and abs(qty) > max_buy:
-                max_buy = abs(qty)
-                to_asset, to_amount = coin, qty
+            if qty > 0:
+                if to_asset is None:
+                    to_asset = coin
+                if coin == to_asset:
+                    to_amount += qty
 
         fees_summary = ", ".join(f"{c} {qty}" for c, qty in fees)
 
